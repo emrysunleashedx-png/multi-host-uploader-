@@ -111,7 +111,7 @@ async def handle_media(client: Client, message: Message):
     await status_msg.edit_text(response)
 
 if __name__ == "__main__":
-    # Bypass Render Port Health check
+    # Dummy HTTP server to pass Render port check
     import http.server
     import socketserver
     import threading
