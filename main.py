@@ -1,3 +1,9 @@
+import asyncio
+import threading
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 import os
 import asyncio
 import httpx
