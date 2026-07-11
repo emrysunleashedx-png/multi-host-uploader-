@@ -6,6 +6,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 import firestore_publish
+import tmdb_fetch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -186,18 +187,27 @@ async def handle_media(client: Client, message: Message):
             "title": guess_title,
             "episode": guess_episode,
             "url": dood_url,
+            "year": None,
+            "category": "series" if guess_episode else "movie",
+            "tmdb_candidates": None,  # populated once /confirm triggers a TMDB search
+            "tmdb_type": None,
         }
 
         title_line = guess_title or "(couldn't guess a title)"
         episode_line = guess_episode or "(none detected)"
+        category_line = PENDING_PUBLISHES[message.chat.id]["category"]
         response = (
             "✅ **Upload complete!**\n\n"
             f"🍿 **Doodstream:** {dood_url}\n\n"
             "**Ready to publish to the site.** Best guess from the caption:\n"
             f"• Title: `{title_line}`\n"
-            f"• Episode: `{episode_line}`\n\n"
-            "Reply `/confirm` to publish as-is, or `/edit <title> | <episode>` "
-            "to correct it first (episode is optional, e.g. `/edit The Scarecrow | S01E02`)."
+            f"• Episode: `{episode_line}`\n"
+            f"• Category: `{category_line}` (guessed from whether an episode was detected)\n\n"
+            "Reply `/confirm` to look this up on TMDB and publish, or "
+            "`/edit <title> | <episode> | <year> | <category>` to correct it first.\n"
+            "All parts after title are optional, e.g.:\n"
+            "`/edit The Scarecrow | S01E02`\n"
+            "`/edit Parasite | | 2019 | movie`"
         )
         await status_msg.edit_text(response)
 
@@ -216,7 +226,7 @@ async def handle_media(client: Client, message: Message):
 
 @app.on_message(filters.private & filters.command("confirm"))
 async def handle_confirm(client: Client, message: Message):
-    pending = PENDING_PUBLISHES.pop(message.chat.id, None)
+    pending = PENDING_PUBLISHES.get(message.chat.id)
     if not pending:
         await message.reply_text("Nothing pending to confirm. Upload a file first.")
         return
@@ -226,11 +236,106 @@ async def handle_confirm(client: Client, message: Message):
             "No title could be guessed for this upload, so it can't be confirmed "
             "as-is. Use `/edit <title> | <episode>` instead."
         )
-        # Put it back so the admin doesn't lose the finished upload link.
-        PENDING_PUBLISHES[message.chat.id] = pending
         return
 
-    await _do_publish(message, pending)
+    # If a TMDB shortlist was already shown and the admin just says /confirm
+    # again without picking, treat it as "publish without TMDB data" -- e.g.
+    # for titles with no TMDB match, or if they just want the plain link up.
+    if pending.get("tmdb_candidates") is not None:
+        await _do_publish(message, pending, extra_fields=None)
+        PENDING_PUBLISHES.pop(message.chat.id, None)
+        return
+
+    status = await message.reply_text(f"🔎 Searching TMDB for \"{pending['title']}\"...")
+    try:
+        search_result = await tmdb_fetch.search_tmdb(pending["title"], pending["category"])
+    except Exception as e:
+        logger.exception("TMDB search failed")
+        await status.edit_text(
+            f"⚠️ TMDB search failed ({type(e).__name__}). Publishing without TMDB data instead."
+        )
+        await _do_publish(message, pending, extra_fields=None)
+        PENDING_PUBLISHES.pop(message.chat.id, None)
+        return
+
+    matches = search_result["matches"]
+    tmdb_type = search_result["tmdb_type"]
+
+    if not matches:
+        await status.edit_text(
+            f"No TMDB matches found for \"{pending['title']}\". Publishing without TMDB data.\n"
+            "(It may be filed under an alternate/original title -- you can always fill in "
+            "poster/synopsis/etc. by hand in admin.html afterwards.)"
+        )
+        await _do_publish(message, pending, extra_fields=None)
+        PENDING_PUBLISHES.pop(message.chat.id, None)
+        return
+
+    ranked = tmdb_fetch.rank_matches_by_year(matches, pending.get("year"))
+
+    if len(ranked) == 1:
+        # Only one candidate -- fetch its details and publish directly,
+        # no need to make the admin pick from a list of one.
+        await status.edit_text("Found 1 match on TMDB — fetching details...")
+        await _fetch_and_publish(message, pending, ranked[0], tmdb_type)
+        PENDING_PUBLISHES.pop(message.chat.id, None)
+        return
+
+    # Multiple candidates -- show a shortlist and wait for /pick N.
+    pending["tmdb_candidates"] = ranked
+    pending["tmdb_type"] = tmdb_type
+    PENDING_PUBLISHES[message.chat.id] = pending
+
+    lines = [tmdb_fetch.format_candidate_line(m, i + 1) for i, m in enumerate(ranked)]
+    year_note = f" (ranked using year hint {pending['year']})" if pending.get("year") else ""
+    await status.edit_text(
+        f"Found {len(ranked)} possible matches{year_note}:\n\n"
+        + "\n".join(lines)
+        + "\n\nReply `/pick <number>` to choose one, or `/confirm` again to "
+          "publish without TMDB data."
+    )
+
+
+@app.on_message(filters.private & filters.command("pick"))
+async def handle_pick(client: Client, message: Message):
+    pending = PENDING_PUBLISHES.get(message.chat.id)
+    if not pending or not pending.get("tmdb_candidates"):
+        await message.reply_text("Nothing to pick from. Use `/confirm` first to search TMDB.")
+        return
+
+    raw = message.text.split(None, 1)
+    arg = raw[1].strip() if len(raw) > 1 else ""
+    if not arg.isdigit():
+        await message.reply_text("Usage: `/pick <number>` -- e.g. `/pick 2`")
+        return
+
+    index = int(arg) - 1
+    candidates = pending["tmdb_candidates"]
+    if index < 0 or index >= len(candidates):
+        await message.reply_text(f"Pick a number between 1 and {len(candidates)}.")
+        return
+
+    status = await message.reply_text("Fetching details from TMDB...")
+    await _fetch_and_publish(message, pending, candidates[index], pending["tmdb_type"], status=status)
+    PENDING_PUBLISHES.pop(message.chat.id, None)
+
+
+async def _fetch_and_publish(message: Message, pending: dict, candidate: dict,
+                              tmdb_type: str, status: Message = None):
+    try:
+        tmdb_id = candidate["id"]
+        details = await tmdb_fetch.fetch_tmdb_details(tmdb_id, tmdb_type)
+    except Exception as e:
+        logger.exception("TMDB detail fetch failed")
+        msg = f"⚠️ Couldn't fetch TMDB details ({type(e).__name__}). Publishing without TMDB data."
+        if status:
+            await status.edit_text(msg)
+        else:
+            await message.reply_text(msg)
+        await _do_publish(message, pending, extra_fields=None)
+        return
+
+    await _do_publish(message, pending, extra_fields=details)
 
 
 @app.on_message(filters.private & filters.command("edit"))
@@ -240,39 +345,61 @@ async def handle_edit(client: Client, message: Message):
         await message.reply_text("Nothing pending to edit. Upload a file first.")
         return
 
-    # Usage: /edit <title> | <episode>   (episode part is optional)
+    # Usage: /edit <title> | <episode> | <year> | <category>
+    # Every part after title is optional; leave a segment blank to keep
+    # whatever's already set (e.g. "/edit The Scarecrow | | 2023" keeps
+    # the existing episode and just sets the year).
     raw = message.text.split(None, 1)
     args = raw[1] if len(raw) > 1 else ""
     if not args.strip():
         await message.reply_text(
-            "Usage: `/edit <title> | <episode>` -- e.g. `/edit The Scarecrow | S01E02` "
-            "(you can omit `| <episode>` if there isn't one)."
+            "Usage: `/edit <title> | <episode> | <year> | <category>`\n"
+            "Only title is required. Examples:\n"
+            "`/edit The Scarecrow | S01E02`\n"
+            "`/edit Parasite | | 2019 | movie`"
         )
         return
 
-    if "|" in args:
-        title_part, episode_part = args.split("|", 1)
-        title = title_part.strip()
-        episode = episode_part.strip() or None
-    else:
-        title = args.strip()
-        episode = pending.get("episode")
+    parts = [p.strip() for p in args.split("|")]
+    title = parts[0]
+    episode = parts[1] if len(parts) > 1 and parts[1] else pending.get("episode")
+    year = parts[2] if len(parts) > 2 and parts[2] else pending.get("year")
+    category = parts[3] if len(parts) > 3 and parts[3] else pending.get("category")
 
     if not title:
         await message.reply_text("Title can't be empty.")
         return
 
+    if category and category not in ("movie", "series"):
+        await message.reply_text("Category must be `movie` or `series`.")
+        return
+
+    # A movie has no episode by definition -- if the admin explicitly sets
+    # category to "movie" (whether just now or previously), don't let a
+    # stale episode value from an earlier /edit or the caption guess leak
+    # through just because this /edit call happened to leave that segment
+    # blank.
+    final_category = category or "series"
+    if final_category == "movie":
+        episode = None
+
     pending["title"] = title
     pending["episode"] = episode
+    pending["year"] = year
+    pending["category"] = final_category
+    # Any manual edit invalidates a previous TMDB search/shortlist.
+    pending["tmdb_candidates"] = None
+    pending["tmdb_type"] = None
     PENDING_PUBLISHES[message.chat.id] = pending
 
     await message.reply_text(
-        f"Updated. Title: `{title}` | Episode: `{episode or '(none)'}`\n"
-        "Reply `/confirm` to publish, or `/edit` again to change it further."
+        f"Updated. Title: `{title}` | Episode: `{episode or '(none)'}` | "
+        f"Year: `{year or '(none)'}` | Category: `{pending['category']}`\n"
+        "Reply `/confirm` to look this up on TMDB and publish, or `/edit` again to change it further."
     )
 
 
-async def _do_publish(message: Message, pending: dict):
+async def _do_publish(message: Message, pending: dict, extra_fields: dict = None):
     status = await message.reply_text("📡 Publishing to the site...")
     try:
         # firestore_publish does blocking network calls (google-cloud-firestore
@@ -282,10 +409,14 @@ async def _do_publish(message: Message, pending: dict):
             pending["title"],
             pending["episode"],
             pending["url"],
+            "Doodstream",
+            pending.get("category", "series"),
+            extra_fields,
         )
         action = result["action"]
         if action == "created":
-            text = f"✅ Published as a **new** entry: `{pending['title']}`"
+            tmdb_note = " (with TMDB data)" if extra_fields else ""
+            text = f"✅ Published as a **new** entry{tmdb_note}: `{pending['title']}`"
         elif action == "appended":
             text = f"✅ Added **{pending['episode'] or 'link'}** to existing entry: `{pending['title']}`"
         else:
