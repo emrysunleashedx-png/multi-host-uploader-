@@ -141,6 +141,13 @@ def parse_title_and_episode(caption: str):
     # before stripping noise words, so the guess reads like a real title.
     title = re.sub(r"[._]+", " ", title)
 
+    # Strip bracketed site watermarks, e.g. "(NKIRI.COM)", "[SITENAME.NET]" --
+    # these are the source channel's branding, not part of the real title.
+    # Matches a bracket/paren group containing a domain-like token
+    # (word.word), so it won't accidentally eat a legitimate parenthetical
+    # like "(2023)" or "(Uncut)".
+    title = re.sub(r"[\(\[][A-Za-z0-9-]+ [A-Za-z]{2,4}[\)\]]", "", title)
+
     # Strip trailing noise like "eng sub", "1080p", file extensions, etc.
     # Conservative list -- better to leave junk in for a human to remove
     # than to strip something that was actually part of the real title.
@@ -264,4 +271,3 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     _, doc_ref = db.collection(ROOT_COLLECTION).add(payload)
     logger.info("Created new doc %s for title=%r (slug=%s)", doc_ref.id, title, slug)
     return {"action": "created", "doc_id": doc_ref.id, "slug": slug}
-
