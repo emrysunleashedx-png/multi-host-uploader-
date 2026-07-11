@@ -48,7 +48,7 @@ async def upload_doodstream(client: httpx.AsyncClient, file_path: str):
             try:
                 upload_data = upload_res.json()
                 result = upload_data.get("result", [])
-                if result and isinstance(result, list) and len(result) > 0:
+                if isinstance(result, list) and len(result) > 0:
                     file_code = result[0].get("filecode") or result[0].get("file_code")
                     if file_code:
                         return f"https://dood.to/d/{file_code}"
@@ -63,6 +63,7 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
         return "Key Missing ⚠️"
     try:
         filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
         url = f"https://earnvids.com/api/upload/server?key={EARNVIDS_KEY}"
         res = await client.get(url, headers=HEADERS)
         
@@ -75,11 +76,18 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
         if not upload_url:
             return f"Server Error: {res_data.get('msg', 'No Upload URL')}"
 
+        data = {
+            "api_key": EARNVIDS_KEY,
+            "key": EARNVIDS_KEY,
+            "file_size": str(file_size)
+        }
+
         with open(file_path, "rb") as f:
+            files = {"file": (filename, f, "application/octet-stream")}
             upload_res = await client.post(
-                upload_url, 
-                files={"file": (filename, f, "video/x-matroska")}, 
-                data={"key": EARNVIDS_KEY, "api_key": EARNVIDS_KEY},
+                f"{upload_url}?key={EARNVIDS_KEY}", 
+                files=files, 
+                data=data,
                 headers=HEADERS,
                 timeout=None
             )
@@ -87,12 +95,12 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
             try:
                 upload_data = upload_res.json()
                 result = upload_data.get("result", [])
-                if result and isinstance(result, list) and len(result) > 0:
+                if isinstance(result, list) and len(result) > 0:
                     file_code = result[0].get("filecode") or result[0].get("file_code")
                     if file_code:
                         return f"https://earnvids.com/d/{file_code}"
-                elif isinstance(upload_data.get("result"), dict):
-                    file_code = upload_data["result"].get("filecode") or upload_data["result"].get("file_code")
+                elif isinstance(result, dict):
+                    file_code = result.get("filecode") or result.get("file_code")
                     if file_code:
                         return f"https://earnvids.com/d/{file_code}"
                 return f"Upload Error: {upload_data}"
@@ -106,6 +114,7 @@ async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
         return "Key Missing ⚠️"
     try:
         filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
         url = f"https://streamwish.com/api/upload/server?key={STREAMHG_KEY}"
         res = await client.get(url, headers=HEADERS)
         
@@ -118,24 +127,27 @@ async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
         if not upload_url:
             return f"Server Error: {res_data.get('msg', 'No Upload URL')}"
 
+        data = {
+            "api_key": STREAMHG_KEY,
+            "key": STREAMHG_KEY,
+            "file_size": str(file_size)
+        }
+
         with open(file_path, "rb") as f:
+            files = {"file": (filename, f, "application/octet-stream")}
             upload_res = await client.post(
-                upload_url, 
-                files={"file": (filename, f, "video/x-matroska")}, 
-                data={"key": STREAMHG_KEY, "api_key": STREAMHG_KEY},
+                f"{upload_url}?key={STREAMHG_KEY}", 
+                files=files, 
+                data=data,
                 headers=HEADERS,
                 timeout=None
             )
             
             try:
                 upload_data = upload_res.json()
-                result = upload_data.get("result", [])
-                if result and isinstance(result, list) and len(result) > 0:
-                    file_code = result[0].get("filecode") or result[0].get("file_code")
-                    if file_code:
-                        return f"https://streamwish.com/f/{file_code}"
-                elif isinstance(upload_data.get("result"), dict):
-                    file_code = upload_data["result"].get("filecode") or upload_data["result"].get("file_code")
+                files_res = upload_data.get("files", upload_data.get("result", []))
+                if isinstance(files_res, list) and len(files_res) > 0:
+                    file_code = files_res[0].get("filecode") or files_res[0].get("file_code")
                     if file_code:
                         return f"https://streamwish.com/f/{file_code}"
                 return f"Upload Error: {upload_data}"
@@ -186,3 +198,4 @@ if __name__ == "__main__":
             
     threading.Thread(target=run_dummy_server, daemon=True).start()
     app.run()
+
