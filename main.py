@@ -4,6 +4,7 @@ import httpx
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
+# Environment variables
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -14,7 +15,6 @@ STREAMHG_KEY = os.getenv("STREAMHG_API_KEY", "")
 
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Browser headers to pass Cloudflare/security checks
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -27,26 +27,36 @@ async def upload_doodstream(client: httpx.AsyncClient, file_path: str):
         url = f"https://doodapi.com/api/upload/server?key={DOODSTREAM_KEY}"
         res = await client.get(url, headers=HEADERS)
         
-        if res.status_code != 200 or not res.text.startswith("{"):
-            return f"API Blocked (HTTP {res.status_code})"
-            
-        res_data = res.json()
+        try:
+            res_data = res.json()
+        except Exception:
+            return f"API Error (HTTP {res.status_code})"
+
         upload_url = res_data.get("result")
-        if upload_url:
-            with open(file_path, "rb") as f:
-                upload_res = await client.post(
-                    upload_url, 
-                    files={"file": (filename, f)}, 
-                    data={"api_key": DOODSTREAM_KEY},
-                    headers=HEADERS,
-                    timeout=None
-                )
-                result = upload_res.json().get("result", [])
-                if result:
-                    return f"https://dood.to/e/{result[0]['file_code']}"
+        if not upload_url:
+            return f"Server Error: {res_data.get('msg', 'No Upload URL')}"
+
+        with open(file_path, "rb") as f:
+            upload_res = await client.post(
+                upload_url, 
+                files={"file": (filename, f)}, 
+                data={"api_key": DOODSTREAM_KEY},
+                headers=HEADERS,
+                timeout=None
+            )
+            
+            try:
+                upload_data = upload_res.json()
+                result = upload_data.get("result", [])
+                if result and isinstance(result, list) and len(result) > 0:
+                    file_code = result[0].get("filecode") or result[0].get("file_code")
+                    if file_code:
+                        return f"https://dood.to/e/{file_code}"
+                return f"Upload Failed: {upload_data.get('msg', 'Unknown Error')}"
+            except Exception:
+                return "Upload Response Invalid"
     except Exception as e:
         return f"Error: {type(e).__name__}"
-    return "Failed ❌"
 
 async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
     if not EARNVIDS_KEY:
@@ -56,26 +66,36 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
         url = f"https://earnvids.com/api/upload/server?key={EARNVIDS_KEY}"
         res = await client.get(url, headers=HEADERS)
         
-        if res.status_code != 200 or not res.text.startswith("{"):
-            return f"API Blocked (HTTP {res.status_code})"
-            
-        res_data = res.json()
+        try:
+            res_data = res.json()
+        except Exception:
+            return f"API Error (HTTP {res.status_code})"
+
         upload_url = res_data.get("result")
-        if upload_url:
-            with open(file_path, "rb") as f:
-                upload_res = await client.post(
-                    upload_url, 
-                    files={"file": (filename, f)}, 
-                    data={"api_key": EARNVIDS_KEY},
-                    headers=HEADERS,
-                    timeout=None
-                )
-                result = upload_res.json().get("result", [])
-                if result:
-                    return f"https://earnvids.com/v/{result[0]['file_code']}"
+        if not upload_url:
+            return f"Server Error: {res_data.get('msg', 'No Upload URL')}"
+
+        with open(file_path, "rb") as f:
+            upload_res = await client.post(
+                upload_url, 
+                files={"file": (filename, f)}, 
+                data={"api_key": EARNVIDS_KEY},
+                headers=HEADERS,
+                timeout=None
+            )
+            
+            try:
+                upload_data = upload_res.json()
+                result = upload_data.get("result", [])
+                if result and isinstance(result, list) and len(result) > 0:
+                    file_code = result[0].get("filecode") or result[0].get("file_code")
+                    if file_code:
+                        return f"https://earnvids.com/v/{file_code}"
+                return f"Upload Failed: {upload_data.get('msg', 'Unknown Error')}"
+            except Exception:
+                return "Upload Response Invalid"
     except Exception as e:
         return f"Error: {type(e).__name__}"
-    return "Failed ❌"
 
 async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
     if not STREAMHG_KEY:
@@ -85,26 +105,36 @@ async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
         url = f"https://streamwish.com/api/upload/server?key={STREAMHG_KEY}"
         res = await client.get(url, headers=HEADERS)
         
-        if res.status_code != 200 or not res.text.startswith("{"):
-            return f"API Blocked (HTTP {res.status_code})"
-            
-        res_data = res.json()
+        try:
+            res_data = res.json()
+        except Exception:
+            return f"API Error (HTTP {res.status_code})"
+
         upload_url = res_data.get("result")
-        if upload_url:
-            with open(file_path, "rb") as f:
-                upload_res = await client.post(
-                    upload_url, 
-                    files={"file": (filename, f)}, 
-                    data={"api_key": STREAMHG_KEY},
-                    headers=HEADERS,
-                    timeout=None
-                )
-                result = upload_res.json().get("result", [])
-                if result:
-                    return f"https://streamwish.com/e/{result[0]['file_code']}"
+        if not upload_url:
+            return f"Server Error: {res_data.get('msg', 'No Upload URL')}"
+
+        with open(file_path, "rb") as f:
+            upload_res = await client.post(
+                upload_url, 
+                files={"file": (filename, f)}, 
+                data={"api_key": STREAMHG_KEY},
+                headers=HEADERS,
+                timeout=None
+            )
+            
+            try:
+                upload_data = upload_res.json()
+                result = upload_data.get("result", [])
+                if result and isinstance(result, list) and len(result) > 0:
+                    file_code = result[0].get("filecode") or result[0].get("file_code")
+                    if file_code:
+                        return f"https://streamwish.com/e/{file_code}"
+                return f"Upload Failed: {upload_data.get('msg', 'Unknown Error')}"
+            except Exception:
+                return "Upload Response Invalid"
     except Exception as e:
         return f"Error: {type(e).__name__}"
-    return "Failed ❌"
 
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_media(client: Client, message: Message):
