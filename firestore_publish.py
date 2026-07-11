@@ -435,3 +435,4 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     _, doc_ref = db.collection(ROOT_COLLECTION).add(payload)
     logger.info("Created new doc %s for title=%r (slug=%s)", doc_ref.id, title, slug)
     return {"action": "created", "doc_id": doc_ref.id, "slug": slug}
+
