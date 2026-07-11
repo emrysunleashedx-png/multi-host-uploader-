@@ -92,4 +92,18 @@ async def handle_media(client: Client, message: Message):
     await status_msg.edit_text(response)
 
 if __name__ == "__main__":
+    # Fake a web server on a background thread to bypass Render's health check
+    import http.server
+    import socketserver
+    
+    def run_dummy_server():
+        port = int(os.getenv("PORT", "8000"))
+        handler = http.server.SimpleHTTPRequestHandler
+        with socketserver.TCPServer(("", port), handler) as httpd:
+            httpd.serve_forever()
+            
+    import threading
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    # Run your bot loop
     app.run()
