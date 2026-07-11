@@ -32,6 +32,13 @@ HOSTERS = {
 # on a stalled connection; use generous but finite limits instead.
 UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
 
+# Warn (don't hard-block) on files at or above this size, since large
+# files mean real bandwidth cost both downloading from Telegram and
+# uploading to Doodstream -- worth surfacing given Render's per-GB
+# bandwidth billing beyond the free plan's included amount. Override via
+# the LARGE_FILE_WARNING_GB env var if this default doesn't fit your usage.
+LARGE_FILE_WARNING_BYTES = int(float(os.getenv("LARGE_FILE_WARNING_GB", "1.5")) * 1024 ** 3)
+
 # In-memory pending-publish state, keyed by chat_id. Holds the parsed guess
 # plus the finished Doodstream URL while waiting for the admin to /confirm
 # or /edit it. This is intentionally simple (no persistence) -- if the bot
@@ -48,6 +55,24 @@ PENDING_PUBLISHES = {}
 # /forceupload is used or a new file comes in (only the most recent
 # duplicate warning can be force-uploaded).
 PENDING_FORCE_UPLOAD = {}
+
+# Remembers the most recently published title per chat, so /feature,
+# /trending, /new, /recommend can default to "whatever I just published"
+# without requiring the admin to retype the title.
+LAST_PUBLISHED_TITLE = {}
+
+# Active batch/season-pack sessions, keyed by chat_id. While a batch is
+# active, incoming files skip the individual confirm/edit prompt and are
+# silently uploaded + recorded here instead; /batch done hands the whole
+# collected list off to one shared confirm/edit/TMDB flow. See handle_media
+# for how files get routed here vs the normal single-file path.
+BATCH_SESSIONS = {}
+
+# Holds a completed batch's episode list + title/TMDB state between
+# /batch done and /batchconfirm, keyed by chat_id -- structurally the
+# batch equivalent of PENDING_PUBLISHES, but with an "episodes" list
+# instead of a single episode/url/quality set.
+BATCH_PENDING_PUBLISH = {}
 
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -216,15 +241,38 @@ async def _attempt_upload(client: httpx.AsyncClient, hoster_name: str, config: d
     return f"Upload Failed: no filecode in response ({upload_data})"
 
 
+async def _parse_source_and_infer_episode(message: Message):
+    """Shared by handle_media and handle_force_upload: parse title/episode
+    from caption/filename, then fill in a missing episode via inference
+    from existing Firestore data if possible. Returns
+    (guess_title, guess_episode, source_text, episode_was_inferred).
+    """
+    filename = getattr(message.document, "file_name", None) or \
+               getattr(message.video, "file_name", None) or ""
+    source_text = (message.caption or "").strip() or filename
+    guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
+    episode_was_inferred = False
+
+    if guess_title and not guess_episode:
+        try:
+            inferred = await asyncio.to_thread(firestore_publish.infer_next_episode, guess_title)
+        except Exception as e:
+            logger.warning("Episode inference failed, proceeding without it: %s", e)
+            inferred = ""
+        if inferred:
+            guess_episode = inferred
+            episode_was_inferred = True
+
+    return guess_title, guess_episode, source_text, episode_was_inferred
+
+
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_media(client: Client, message: Message):
     # Parse title/episode from caption/filename BEFORE downloading anything,
     # so an already-published episode can be caught without spending any
     # Telegram download time or Doodstream upload bandwidth on it.
-    filename = getattr(message.document, "file_name", None) or \
-               getattr(message.video, "file_name", None) or ""
-    source_text = (message.caption or "").strip() or filename
-    guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
+    guess_title, guess_episode, source_text, episode_was_inferred = \
+        await _parse_source_and_infer_episode(message)
 
     if guess_title:
         try:
@@ -254,7 +302,24 @@ async def handle_media(client: Client, message: Message):
             PENDING_FORCE_UPLOAD[message.chat.id] = message
             return
 
-    await _download_and_upload(client, message, guess_title, guess_episode, source_text)
+    file_size = getattr(message.document, "file_size", None) or \
+                getattr(message.video, "file_size", None) or 0
+    if file_size >= LARGE_FILE_WARNING_BYTES:
+        size_gb = file_size / (1024 ** 3)
+        await message.reply_text(
+            f"⚠️ **Large file** — {size_gb:.2f} GB. This will use a good chunk of "
+            "bandwidth both downloading from Telegram and uploading to Doodstream "
+            "(worth knowing if you're watching your Render bandwidth quota).\n\n"
+            "Reply `/forceupload` to proceed anyway, or just ignore this to skip it."
+        )
+        PENDING_FORCE_UPLOAD[message.chat.id] = message
+        return
+
+    if message.chat.id in BATCH_SESSIONS and BATCH_SESSIONS[message.chat.id]["active"]:
+        await _download_and_collect_for_batch(message, guess_title, guess_episode, source_text)
+        return
+
+    await _download_and_upload(client, message, guess_title, guess_episode, source_text, episode_was_inferred)
 
 
 @app.on_message(filters.private & filters.command("forceupload"))
@@ -263,93 +328,251 @@ async def handle_force_upload(client: Client, message: Message):
     if not original_message:
         await message.reply_text(
             "Nothing to force-upload. This only works right after a "
-            "duplicate warning, for that same file."
+            "duplicate or large-file warning, for that same file."
         )
         return
 
-    filename = getattr(original_message.document, "file_name", None) or \
-               getattr(original_message.video, "file_name", None) or ""
-    source_text = (original_message.caption or "").strip() or filename
-    guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
+    guess_title, guess_episode, source_text, episode_was_inferred = \
+        await _parse_source_and_infer_episode(original_message)
 
-    await message.reply_text("Proceeding with download/upload despite the duplicate warning...")
-    await _download_and_upload(client, original_message, guess_title, guess_episode, source_text)
+    await message.reply_text("Proceeding with download/upload despite the warning...")
+    await _download_and_upload(client, original_message, guess_title, guess_episode, source_text, episode_was_inferred)
 
 
-async def _download_and_upload(client: Client, message: Message, guess_title: str,
-                                guess_episode: str, source_text: str):
-    status_msg = await message.reply_text("📥 Downloading file from Telegram...")
-
+async def _download_and_upload_core(message: Message, status_msg: Message):
+    """Shared by both the single-file flow and batch mode: download from
+    Telegram, upload to Doodstream, clean up the local file. Returns
+    (dood_url_or_error_string, succeeded: bool). The caller decides what
+    to do next (prompt for confirm, or silently append to a batch).
+    """
     try:
         # Pyrogram's download() is already async-native (runs its own I/O off
         # the main loop internally), so no to_thread wrapper needed here.
         file_path = await message.download()
     except Exception as e:
         logger.error("Download failed: %s", e)
-        await status_msg.edit_text("❌ Download failed.")
-        return
+        return "Download failed.", False
 
     if not file_path or not os.path.exists(file_path):
-        await status_msg.edit_text("❌ Download failed.")
-        return
+        return "Download failed.", False
 
     try:
         await status_msg.edit_text("🚀 Uploading to Doodstream...")
-
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
             dood_url = await upload_to_hoster(http_client, "Doodstream", file_path)
 
-        # If the upload itself failed, there's nothing to publish -- just
-        # report the failure and stop (no point asking the admin to
-        # confirm a title for a link that doesn't exist). Distinguish
-        # outage-style failures (worth telling the admin plainly that
-        # it's Doodstream's side, not theirs) from other failure types.
         if not dood_url.startswith("http"):
-            await status_msg.edit_text(_format_upload_failure(dood_url))
-            return
+            return _format_upload_failure(dood_url), False
 
-        logger.info("Parsing title/episode from source_text=%r (caption=%r, filename=%r)",
-                    source_text, message.caption, getattr(message.document, "file_name", None))
-
-        PENDING_PUBLISHES[message.chat.id] = {
-            "title": guess_title,
-            "episode": guess_episode,
-            "url": dood_url,
-            "year": None,
-            "category": "series" if guess_episode else "movie",
-            "tmdb_candidates": None,  # populated once /confirm triggers a TMDB search
-            "tmdb_type": None,
-        }
-
-        title_line = guess_title or "(couldn't guess a title)"
-        episode_line = guess_episode or "(none detected)"
-        category_line = PENDING_PUBLISHES[message.chat.id]["category"]
-        response = (
-            "✅ **Upload complete!**\n\n"
-            f"🍿 **Doodstream:** {dood_url}\n\n"
-            "**Ready to publish to the site.** Best guess from the caption:\n"
-            f"• Title: `{title_line}`\n"
-            f"• Episode: `{episode_line}`\n"
-            f"• Category: `{category_line}` (guessed from whether an episode was detected)\n\n"
-            "Reply `/confirm` to look this up on TMDB and publish, or "
-            "`/edit <title> | <episode> | <year> | <category>` to correct it first.\n"
-            "All parts after title are optional, e.g.:\n"
-            "`/edit The Scarecrow | S01E02`\n"
-            "`/edit Parasite | | 2019 | movie`"
-        )
-        await status_msg.edit_text(response)
+        return dood_url, True
 
     except Exception as e:
         logger.exception("Unexpected error while processing %s", file_path)
-        await status_msg.edit_text(f"❌ Unexpected error: {type(e).__name__}")
+        return f"Unexpected error: {type(e).__name__}", False
 
     finally:
-        # Always clean up the downloaded file, even if uploads raised.
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except OSError as e:
                 logger.warning("Failed to remove temp file %s: %s", file_path, e)
+
+
+async def _download_and_upload(client: Client, message: Message, guess_title: str,
+                                guess_episode: str, source_text: str,
+                                episode_was_inferred: bool = False):
+    status_msg = await message.reply_text("📥 Downloading file from Telegram...")
+
+    dood_url, succeeded = await _download_and_upload_core(message, status_msg)
+    if not succeeded:
+        await status_msg.edit_text(f"❌ {dood_url}")
+        return
+
+    logger.info("Parsing title/episode from source_text=%r (caption=%r, filename=%r)",
+                source_text, message.caption, getattr(message.document, "file_name", None))
+    guess_quality = firestore_publish.detect_quality(source_text)
+
+    PENDING_PUBLISHES[message.chat.id] = {
+        "title": guess_title,
+        "episode": guess_episode,
+        "url": dood_url,
+        "year": None,
+        "category": "series" if guess_episode else "movie",
+        "quality": guess_quality,
+        "episode_was_inferred": episode_was_inferred,
+        "tmdb_candidates": None,  # populated once /confirm triggers a TMDB search
+        "tmdb_type": None,
+    }
+
+    title_line = guess_title or "(couldn't guess a title)"
+    if guess_episode and episode_was_inferred:
+        episode_line = f"{guess_episode} (inferred — not in filename, double check this!)"
+    else:
+        episode_line = guess_episode or "(none detected)"
+    category_line = PENDING_PUBLISHES[message.chat.id]["category"]
+    quality_line = guess_quality or "(not detected)"
+    response = (
+        "✅ **Upload complete!**\n\n"
+        f"🍿 **Doodstream:** {dood_url}\n\n"
+        "**Ready to publish to the site.** Best guess from the caption:\n"
+        f"• Title: `{title_line}`\n"
+        f"• Episode: {episode_line}\n"
+        f"• Category: `{category_line}` (guessed from whether an episode was detected)\n"
+        f"• Quality: `{quality_line}`\n\n"
+        "Reply `/confirm` to look this up on TMDB and publish, or "
+        "`/edit <title> | <episode> | <year> | <category> | <quality>` to correct it first.\n"
+        "All parts after title are optional, e.g.:\n"
+        "`/edit The Scarecrow | S01E02`\n"
+        "`/edit Parasite | | 2019 | movie`"
+    )
+    await status_msg.edit_text(response)
+
+
+async def _download_and_collect_for_batch(message: Message, guess_title: str,
+                                           guess_episode: str, source_text: str):
+    """Batch-mode equivalent of _download_and_upload: downloads and
+    uploads the file exactly the same way, but instead of prompting for
+    confirm/edit, silently records the result into the active batch
+    session and shows a one-line progress update. The actual Firestore
+    publish for everything collected happens once, in bulk, when the
+    admin runs /batch done.
+    """
+    session = BATCH_SESSIONS[message.chat.id]
+    status_msg = await message.reply_text("📥 Downloading (batch)...")
+
+    dood_url, succeeded = await _download_and_upload_core(message, status_msg)
+    if not succeeded:
+        await status_msg.edit_text(
+            f"❌ {dood_url}\n\n(This file was skipped -- the rest of the batch is unaffected.)"
+        )
+        return
+
+    guess_quality = firestore_publish.detect_quality(source_text)
+
+    # Batches are for a single series -- capture the first file's title
+    # guess as the batch's title if we don't have one yet, but don't let
+    # a later file's (possibly worse) guess overwrite it.
+    if not session.get("title_guess") and guess_title:
+        session["title_guess"] = guess_title
+
+    entry = {
+        "episode": guess_episode or "",
+        "quality": guess_quality,
+        "url": dood_url,
+        "source_text": source_text,
+    }
+    session["episodes"].append(entry)
+
+    episode_note = guess_episode or "(no episode detected -- check this in /batch status)"
+    await status_msg.edit_text(
+        f"✅ Added to batch: `{episode_note}`"
+        + (f" [{guess_quality}]" if guess_quality else "")
+        + f"\n{len(session['episodes'])} file(s) collected so far. Send more, or `/batch done` to finish."
+    )
+
+
+@app.on_message(filters.private & filters.command("batch"))
+async def handle_batch(client: Client, message: Message):
+    args = message.command[1:]  # e.g. ["start"], ["done"], ["status"], ["cancel"]
+    sub = args[0].lower() if args else ""
+    chat_id = message.chat.id
+
+    if sub == "start":
+        if chat_id in BATCH_SESSIONS and BATCH_SESSIONS[chat_id]["active"]:
+            await message.reply_text(
+                f"A batch is already active with {len(BATCH_SESSIONS[chat_id]['episodes'])} "
+                "file(s) collected. Use `/batch done` to finish it, or `/batch cancel` to discard it."
+            )
+            return
+        BATCH_SESSIONS[chat_id] = {"active": True, "episodes": [], "title_guess": None}
+        await message.reply_text(
+            "📦 **Batch mode started.** Forward all the episodes now — each one uploads "
+            "immediately but won't ask you to confirm individually. "
+            "When you're done, send `/batch done`."
+        )
+        return
+
+    if sub == "status":
+        session = BATCH_SESSIONS.get(chat_id)
+        if not session or not session["active"]:
+            await message.reply_text("No active batch. Use `/batch start` to begin one.")
+            return
+        if not session["episodes"]:
+            await message.reply_text("Batch active, but no files collected yet.")
+            return
+        lines = [f"📦 **Batch in progress** — {len(session['episodes'])} file(s):"]
+        for e in session["episodes"]:
+            ep = e["episode"] or "(no episode detected)"
+            q = f" [{e['quality']}]" if e["quality"] else ""
+            lines.append(f"• {ep}{q}")
+        await message.reply_text("\n".join(lines))
+        return
+
+    if sub == "cancel":
+        session = BATCH_SESSIONS.pop(chat_id, None)
+        pending_publish = BATCH_PENDING_PUBLISH.pop(chat_id, None)
+        if not session and not pending_publish:
+            await message.reply_text("No active batch to cancel.")
+            return
+        count = len(session["episodes"]) if session else len(pending_publish["episodes"])
+        await message.reply_text(
+            f"🗑️ Batch cancelled. {count} file(s) had already been uploaded to Doodstream "
+            "(those links still exist, just not published to the site) -- nothing was "
+            "published to Firestore."
+        )
+        return
+
+    if sub == "done":
+        session = BATCH_SESSIONS.get(chat_id)
+        if not session or not session["active"]:
+            await message.reply_text("No active batch. Use `/batch start` to begin one.")
+            return
+        if not session["episodes"]:
+            await message.reply_text("No files were collected in this batch. `/batch cancel` to discard it.")
+            return
+
+        # Remove the collection session entirely (not just mark inactive)
+        # so a later /batch cancel doesn't find this stale entry instead
+        # of the real BATCH_PENDING_PUBLISH state that /batchconfirm acts on.
+        del BATCH_SESSIONS[chat_id]
+
+        title_guess = session.get("title_guess") or ""
+        episodes_missing = sum(1 for e in session["episodes"] if not e["episode"])
+
+        BATCH_PENDING_PUBLISH[chat_id] = {
+            "title": title_guess,
+            "episodes": session["episodes"],
+            "year": None,
+            "category": "series",
+            "tmdb_candidates": None,
+            "tmdb_type": None,
+        }
+
+        lines = [
+            f"📦 **Batch collection done** — {len(session['episodes'])} file(s):",
+            "",
+        ]
+        for e in session["episodes"]:
+            ep = e["episode"] or "❓(no episode detected)"
+            q = f" [{e['quality']}]" if e["quality"] else ""
+            lines.append(f"• {ep}{q}")
+        lines.append("")
+        lines.append(f"Guessed title: `{title_guess or '(none — use /batchedit to set one)'}`")
+        if episodes_missing:
+            lines.append(
+                f"\n⚠️ {episodes_missing} file(s) have no detected episode number -- "
+                "these need fixing before publishing (see `/batchedit`)."
+            )
+        lines.append(
+            "\nReply `/batchconfirm` to look this up on TMDB and publish all episodes, "
+            "or `/batchedit <title> | <year> | <category>` to correct the title first."
+        )
+        await message.reply_text("\n".join(lines))
+        return
+
+    await message.reply_text(
+        "Usage: `/batch start`, `/batch status`, `/batch done`, or `/batch cancel`."
+    )
 
 
 def _format_upload_failure(error_text: str) -> str:
@@ -381,7 +604,26 @@ def _format_upload_failure(error_text: str) -> str:
 
 @app.on_message(filters.private & filters.command(["status", "pending"]))
 async def handle_status(client: Client, message: Message):
-    pending = PENDING_PUBLISHES.get(message.chat.id)
+    chat_id = message.chat.id
+
+    batch_session = BATCH_SESSIONS.get(chat_id)
+    if batch_session and batch_session["active"]:
+        await message.reply_text(
+            f"📦 Batch mode is active — {len(batch_session['episodes'])} file(s) collected so far. "
+            "Send more files, or `/batch done` to finish."
+        )
+        return
+
+    batch_pending = BATCH_PENDING_PUBLISH.get(chat_id)
+    if batch_pending:
+        await message.reply_text(
+            f"📦 A completed batch is awaiting confirmation — {len(batch_pending['episodes'])} "
+            f"episode(s), title guess `{batch_pending.get('title') or '(none)'}`.\n"
+            "Reply `/batchconfirm` to publish, or `/batchedit` to correct the title first."
+        )
+        return
+
+    pending = PENDING_PUBLISHES.get(chat_id)
     if not pending:
         await message.reply_text("Nothing pending right now. Send a video/file to get started.")
         return
@@ -390,6 +632,7 @@ async def handle_status(client: Client, message: Message):
     episode_line = pending.get("episode") or "(none)"
     year_line = pending.get("year") or "(none)"
     category_line = pending.get("category", "series")
+    quality_line = pending.get("quality") or "(not detected)"
 
     lines = [
         "📋 **Pending upload:**",
@@ -397,6 +640,7 @@ async def handle_status(client: Client, message: Message):
         f"• Episode: `{episode_line}`",
         f"• Year: `{year_line}`",
         f"• Category: `{category_line}`",
+        f"• Quality: `{quality_line}`",
         f"• Doodstream link: {pending.get('url', '(none)')}",
     ]
 
@@ -438,19 +682,74 @@ async def handle_find(client: Client, message: Message):
     await status.edit_text("\n".join(lines))
 
 
+@app.on_message(filters.private & filters.command(["feature", "trending", "new", "recommend"]))
+async def handle_toggle_flag(client: Client, message: Message):
+    # message.command[0] is the command word actually used (without the
+    # slash), e.g. "feature" for /feature -- map it to toggle_flag's key
+    # names, noting /recommend maps to the "recommended" flag since the
+    # command reads better as a verb than the noun the flag uses.
+    command_word = message.command[0]
+    flag_name = {
+        "feature": "featured",
+        "trending": "trending",
+        "new": "new",
+        "recommend": "recommended",
+    }[command_word]
+
+    raw = message.text.split(None, 1)
+    explicit_title = raw[1].strip() if len(raw) > 1 else ""
+    title = explicit_title or LAST_PUBLISHED_TITLE.get(message.chat.id)
+
+    if not title:
+        await message.reply_text(
+            f"Usage: `/{command_word} <title>` -- or just `/{command_word}` right after "
+            "publishing something to apply it to that title."
+        )
+        return
+
+    try:
+        result = await asyncio.to_thread(firestore_publish.toggle_flag, title, flag_name)
+    except Exception as e:
+        logger.exception("Flag toggle failed")
+        await message.reply_text(f"❌ Couldn't update `{title}`: {type(e).__name__}: {e}")
+        return
+
+    if not result.get("found"):
+        await message.reply_text(
+            f"Couldn't find a published title matching `{title}`. "
+            "Try `/find <title>` to check the exact title on the site."
+        )
+        return
+
+    _, emoji = firestore_publish.TOGGLEABLE_FLAGS[flag_name]
+    state_word = "ON" if result["new_value"] else "OFF"
+    await message.reply_text(f"{emoji} `{result['title']}` — {command_word} is now **{state_word}**.")
+
+
 @app.on_message(filters.private & filters.command("help"))
 async def handle_help(client: Client, message: Message):
     await message.reply_text(
         "**NovaFlix Media Router — commands**\n\n"
         "Send a video or document to start an upload. After it finishes:\n"
         "• `/confirm` — look the guessed title up on TMDB and publish\n"
-        "• `/edit <title> | <episode> | <year> | <category>` — correct the guess first "
+        "• `/edit <title> | <episode> | <year> | <category> | <quality>` — correct the guess first "
         "(only title is required, e.g. `/edit Parasite | | 2019 | movie`)\n"
         "• `/pick <number>` — choose from a TMDB shortlist if multiple matches came up\n\n"
+        "**Batch mode** (for season packs / many episodes at once):\n"
+        "• `/batch start` — begin collecting; forward all episodes, each uploads "
+        "immediately without asking for confirm\n"
+        "• `/batch status` — see what's been collected so far\n"
+        "• `/batch done` — finish collecting and move to one shared confirm step\n"
+        "• `/batchconfirm`, `/batchpick <number>`, `/batchedit <title> | <year> | <category>` "
+        "— same as /confirm, /pick, /edit but apply to the whole batch at once\n"
+        "• `/batch cancel` — discard a batch (already-uploaded Doodstream links aren't deleted, "
+        "just not published)\n\n"
         "Other commands:\n"
         "• `/status` or `/pending` — see what's currently awaiting confirmation\n"
         "• `/find <title>` — check if something's already published on the site\n"
         "• `/forceupload` — upload anyway after a duplicate warning\n"
+        "• `/feature`, `/trending`, `/new`, `/recommend` — toggle that flag on the site "
+        "(defaults to whatever you just published, or pass a title: `/feature The Scarecrow`)\n"
         "• `/help` — this message"
     )
 
@@ -576,7 +875,7 @@ async def handle_edit(client: Client, message: Message):
         await message.reply_text("Nothing pending to edit. Upload a file first.")
         return
 
-    # Usage: /edit <title> | <episode> | <year> | <category>
+    # Usage: /edit <title> | <episode> | <year> | <category> | <quality>
     # Every part after title is optional; leave a segment blank to keep
     # whatever's already set (e.g. "/edit The Scarecrow | | 2023" keeps
     # the existing episode and just sets the year).
@@ -584,10 +883,11 @@ async def handle_edit(client: Client, message: Message):
     args = raw[1] if len(raw) > 1 else ""
     if not args.strip():
         await message.reply_text(
-            "Usage: `/edit <title> | <episode> | <year> | <category>`\n"
+            "Usage: `/edit <title> | <episode> | <year> | <category> | <quality>`\n"
             "Only title is required. Examples:\n"
             "`/edit The Scarecrow | S01E02`\n"
-            "`/edit Parasite | | 2019 | movie`"
+            "`/edit Parasite | | 2019 | movie`\n"
+            "`/edit The Scarecrow | S01E02 | | | 1080p`"
         )
         return
 
@@ -596,6 +896,7 @@ async def handle_edit(client: Client, message: Message):
     episode = parts[1] if len(parts) > 1 and parts[1] else pending.get("episode")
     year = parts[2] if len(parts) > 2 and parts[2] else pending.get("year")
     category = parts[3] if len(parts) > 3 and parts[3] else pending.get("category")
+    quality = parts[4] if len(parts) > 4 and parts[4] else pending.get("quality")
 
     if not title:
         await message.reply_text("Title can't be empty.")
@@ -604,6 +905,12 @@ async def handle_edit(client: Client, message: Message):
     if category and category not in ("movie", "series"):
         await message.reply_text("Category must be `movie` or `series`.")
         return
+
+    if quality and quality.lower() not in ("2160p", "4k", "1080p", "720p", "480p"):
+        await message.reply_text("Quality must be one of: 2160p, 1080p, 720p, 480p.")
+        return
+    if quality:
+        quality = "2160p" if quality.lower() == "4k" else quality.lower()
 
     # A movie has no episode by definition -- if the admin explicitly sets
     # category to "movie" (whether just now or previously), don't let a
@@ -618,6 +925,7 @@ async def handle_edit(client: Client, message: Message):
     pending["episode"] = episode
     pending["year"] = year
     pending["category"] = final_category
+    pending["quality"] = quality or ""
     # Any manual edit invalidates a previous TMDB search/shortlist.
     pending["tmdb_candidates"] = None
     pending["tmdb_type"] = None
@@ -625,7 +933,8 @@ async def handle_edit(client: Client, message: Message):
 
     await message.reply_text(
         f"Updated. Title: `{title}` | Episode: `{episode or '(none)'}` | "
-        f"Year: `{year or '(none)'}` | Category: `{pending['category']}`\n"
+        f"Year: `{year or '(none)'}` | Category: `{pending['category']}` | "
+        f"Quality: `{pending['quality'] or '(none)'}`\n"
         "Reply `/confirm` to look this up on TMDB and publish, or `/edit` again to change it further."
     )
 
@@ -643,6 +952,7 @@ async def _do_publish(message: Message, pending: dict, extra_fields: dict = None
             "Doodstream",
             pending.get("category", "series"),
             extra_fields,
+            pending.get("quality", ""),
         )
         action = result["action"]
         if action == "created":
@@ -652,6 +962,12 @@ async def _do_publish(message: Message, pending: dict, extra_fields: dict = None
             text = f"✅ Added **{pending['episode'] or 'link'}** to existing entry: `{pending['title']}`"
         else:
             text = f"ℹ️ This link was already published for `{pending['title']}` — skipped duplicate."
+
+        # Remember this as "the last thing published in this chat", so
+        # /feature, /trending, /new, /recommend can default to it without
+        # requiring the admin to retype the title right after confirming.
+        LAST_PUBLISHED_TITLE[message.chat.id] = pending["title"]
+
         await status.edit_text(text)
     except Exception as e:
         logger.exception("Failed to publish to Firestore")
@@ -660,6 +976,214 @@ async def _do_publish(message: Message, pending: dict, extra_fields: dict = None
             "The Doodstream upload itself is fine -- you can add it manually "
             "in admin.html using the link above."
         )
+
+
+@app.on_message(filters.private & filters.command("batchedit"))
+async def handle_batch_edit(client: Client, message: Message):
+    pending = BATCH_PENDING_PUBLISH.get(message.chat.id)
+    if not pending:
+        await message.reply_text("No completed batch waiting. Use `/batch done` first.")
+        return
+
+    raw = message.text.split(None, 1)
+    args = raw[1] if len(raw) > 1 else ""
+    if not args.strip():
+        await message.reply_text(
+            "Usage: `/batchedit <title> | <year> | <category>`\n"
+            "Only title is required, e.g. `/batchedit The Scarecrow | 2023`\n"
+            "(There's no per-episode field here -- fix individual episode numbers "
+            "by re-running `/batch` if something was misdetected.)"
+        )
+        return
+
+    parts = [p.strip() for p in args.split("|")]
+    title = parts[0]
+    year = parts[1] if len(parts) > 1 and parts[1] else pending.get("year")
+    category = parts[2] if len(parts) > 2 and parts[2] else pending.get("category")
+
+    if not title:
+        await message.reply_text("Title can't be empty.")
+        return
+    if category and category not in ("movie", "series"):
+        await message.reply_text("Category must be `movie` or `series`.")
+        return
+
+    pending["title"] = title
+    pending["year"] = year
+    pending["category"] = category or "series"
+    pending["tmdb_candidates"] = None
+    pending["tmdb_type"] = None
+    BATCH_PENDING_PUBLISH[message.chat.id] = pending
+
+    await message.reply_text(
+        f"Updated. Title: `{title}` | Year: `{year or '(none)'}` | Category: `{pending['category']}`\n"
+        "Reply `/batchconfirm` to look this up on TMDB and publish all episodes."
+    )
+
+
+@app.on_message(filters.private & filters.command("batchconfirm"))
+async def handle_batch_confirm(client: Client, message: Message):
+    pending = BATCH_PENDING_PUBLISH.get(message.chat.id)
+    if not pending:
+        await message.reply_text("No completed batch waiting. Use `/batch done` first.")
+        return
+
+    if not pending["title"]:
+        await message.reply_text(
+            "No title could be guessed for this batch, so it can't be confirmed as-is. "
+            "Use `/batchedit <title>` instead."
+        )
+        return
+
+    if pending.get("tmdb_candidates") is not None:
+        await _do_batch_publish(message, pending, extra_fields=None)
+        BATCH_PENDING_PUBLISH.pop(message.chat.id, None)
+        return
+
+    status = await message.reply_text(f"🔎 Searching TMDB for \"{pending['title']}\"...")
+    try:
+        search_result = await tmdb_fetch.search_tmdb(pending["title"], pending["category"])
+    except Exception as e:
+        logger.exception("TMDB search failed for batch")
+        await status.edit_text(
+            f"⚠️ TMDB search failed ({type(e).__name__}). Publishing all episodes without TMDB data."
+        )
+        await _do_batch_publish(message, pending, extra_fields=None)
+        BATCH_PENDING_PUBLISH.pop(message.chat.id, None)
+        return
+
+    matches = search_result["matches"]
+    tmdb_type = search_result["tmdb_type"]
+
+    if not matches:
+        await status.edit_text(
+            f"No TMDB matches found for \"{pending['title']}\". Publishing all episodes without TMDB data."
+        )
+        await _do_batch_publish(message, pending, extra_fields=None)
+        BATCH_PENDING_PUBLISH.pop(message.chat.id, None)
+        return
+
+    ranked = tmdb_fetch.rank_matches_by_year(matches, pending.get("year"))
+
+    if len(ranked) == 1:
+        await status.edit_text("Found 1 match on TMDB — fetching details...")
+        await _batch_fetch_and_publish(message, pending, ranked[0], tmdb_type)
+        BATCH_PENDING_PUBLISH.pop(message.chat.id, None)
+        return
+
+    pending["tmdb_candidates"] = ranked
+    pending["tmdb_type"] = tmdb_type
+    BATCH_PENDING_PUBLISH[message.chat.id] = pending
+
+    lines = [tmdb_fetch.format_candidate_line(m, i + 1) for i, m in enumerate(ranked)]
+    year_note = f" (ranked using year hint {pending['year']})" if pending.get("year") else ""
+    await status.edit_text(
+        f"Found {len(ranked)} possible matches{year_note}:\n\n"
+        + "\n".join(lines)
+        + "\n\nReply `/batchpick <number>` to choose one, or `/batchconfirm` again to "
+          "publish all episodes without TMDB data."
+    )
+
+
+@app.on_message(filters.private & filters.command("batchpick"))
+async def handle_batch_pick(client: Client, message: Message):
+    pending = BATCH_PENDING_PUBLISH.get(message.chat.id)
+    if not pending or not pending.get("tmdb_candidates"):
+        await message.reply_text("Nothing to pick from. Use `/batchconfirm` first to search TMDB.")
+        return
+
+    raw = message.text.split(None, 1)
+    arg = raw[1].strip() if len(raw) > 1 else ""
+    if not arg.isdigit():
+        await message.reply_text("Usage: `/batchpick <number>` -- e.g. `/batchpick 2`")
+        return
+
+    index = int(arg) - 1
+    candidates = pending["tmdb_candidates"]
+    if index < 0 or index >= len(candidates):
+        await message.reply_text(f"Pick a number between 1 and {len(candidates)}.")
+        return
+
+    status = await message.reply_text("Fetching details from TMDB...")
+    await _batch_fetch_and_publish(message, pending, candidates[index], pending["tmdb_type"], status=status)
+    BATCH_PENDING_PUBLISH.pop(message.chat.id, None)
+
+
+async def _batch_fetch_and_publish(message: Message, pending: dict, candidate: dict,
+                                    tmdb_type: str, status: Message = None):
+    try:
+        tmdb_id = candidate["id"]
+        details = await tmdb_fetch.fetch_tmdb_details(tmdb_id, tmdb_type)
+    except Exception as e:
+        logger.exception("TMDB detail fetch failed for batch")
+        msg = f"⚠️ Couldn't fetch TMDB details ({type(e).__name__}). Publishing all episodes without TMDB data."
+        if status:
+            await status.edit_text(msg)
+        else:
+            await message.reply_text(msg)
+        await _do_batch_publish(message, pending, extra_fields=None)
+        return
+
+    await _do_batch_publish(message, pending, extra_fields=details)
+
+
+async def _do_batch_publish(message: Message, pending: dict, extra_fields: dict = None):
+    """Publish every episode collected in a batch, in order, reusing the
+    same shared title/category/TMDB data for all of them. TMDB extra_fields
+    is only actually used for the FIRST episode published (which is
+    whichever one ends up creating the doc, if it doesn't already exist);
+    publish_doodstream_link itself already ignores extra_fields on append,
+    so passing it through unconditionally for every call is safe and
+    simpler than tracking "was this the creating call" here too.
+
+    Episodes with no detected episode number are skipped with a clear
+    warning rather than silently publishing them as blank/duplicate
+    entries -- those need a manual fix (re-upload with a clearer filename,
+    or handled individually outside batch mode).
+    """
+    status = await message.reply_text(
+        f"📡 Publishing {len(pending['episodes'])} episode(s) to the site..."
+    )
+
+    published, skipped, failed = [], [], []
+
+    for ep in pending["episodes"]:
+        if not ep["episode"]:
+            skipped.append(ep)
+            continue
+        try:
+            result = await asyncio.to_thread(
+                firestore_publish.publish_doodstream_link,
+                pending["title"],
+                ep["episode"],
+                ep["url"],
+                "Doodstream",
+                pending.get("category", "series"),
+                extra_fields,
+                ep.get("quality", ""),
+            )
+            published.append((ep, result["action"]))
+        except Exception as e:
+            logger.exception("Failed to publish batch episode %s", ep.get("episode"))
+            failed.append((ep, str(e)))
+
+    LAST_PUBLISHED_TITLE[message.chat.id] = pending["title"]
+
+    lines = [f"✅ **Batch publish complete** for `{pending['title']}`:", ""]
+    if published:
+        lines.append(f"Published {len(published)} episode(s):")
+        for ep, action in published:
+            lines.append(f"• {ep['episode']} ({action})")
+    if skipped:
+        lines.append("")
+        lines.append(f"⚠️ Skipped {len(skipped)} file(s) with no detected episode number.")
+    if failed:
+        lines.append("")
+        lines.append(f"❌ Failed to publish {len(failed)} episode(s):")
+        for ep, err in failed:
+            lines.append(f"• {ep.get('episode', '?')}: {err}")
+
+    await status.edit_text("\n".join(lines))
 
 
 if __name__ == "__main__":
