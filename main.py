@@ -41,12 +41,42 @@ HEADERS = {
 }
 
 
-def _extract_filecode(result):
-    """Handle both list-of-dicts and dict result shapes, and either key name."""
+def _extract_filecode_from_entry(entry):
+    """Pull a filecode out of a single dict entry, whichever key it uses."""
+    if isinstance(entry, dict):
+        return entry.get("filecode") or entry.get("file_code")
+    return None
+
+
+def _extract_filecode(upload_data):
+    """Extract the filecode from an upload response.
+
+    Per EarnVids' documented API (earnvids.com/api.html), a successful file
+    upload response looks like:
+        {"msg": "OK", "status": 200,
+         "files": [{"filecode": "...", "filename": "...", "status": "OK"}]}
+    i.e. the list lives under the top-level "files" key, not "result".
+
+    Doodstream (and possibly EarnVids servers that drift from their own
+    docs) have been observed returning the filecode under "result" instead,
+    as either a list or a single dict. We check the documented shape first,
+    then fall back to the "result"-based shape for compatibility.
+    """
+    # Documented shape: top-level "files" list.
+    files = upload_data.get("files")
+    if isinstance(files, list) and files:
+        code = _extract_filecode_from_entry(files[0])
+        if code:
+            return code
+
+    # Fallback shape: top-level "result", either list or dict.
+    result = upload_data.get("result")
     if isinstance(result, list) and result:
         result = result[0]
-    if isinstance(result, dict):
-        return result.get("filecode") or result.get("file_code")
+    code = _extract_filecode_from_entry(result)
+    if code:
+        return code
+
     return None
 
 
@@ -86,12 +116,11 @@ async def upload_to_hoster(client: httpx.AsyncClient, hoster_name: str, file_pat
     if not upload_url:
         return f"Server Error: {server_data.get('msg', 'No Upload URL')}"
 
-    extra_data = {"api_key": api_key}
-    if hoster_name == "EarnVids":
-        # EarnVids additionally wants file_size and the key repeated as a query param.
-        extra_data["key"] = api_key
-        extra_data["file_size"] = str(os.path.getsize(file_path))
-        upload_url = f"{upload_url}?key={api_key}"
+    # Per EarnVids' documented API, the upload POST only needs "key" (not
+    # "api_key", no repeated query-string key, no file_size param).
+    # Doodstream's docs use "api_key" as the form field name instead.
+    key_field = "key" if hoster_name == "EarnVids" else "api_key"
+    extra_data = {key_field: api_key}
 
     try:
         # Reading the file happens inside a worker thread via to_thread so we
@@ -124,12 +153,16 @@ async def upload_to_hoster(client: httpx.AsyncClient, hoster_name: str, file_pat
         logger.warning("%s: invalid upload response: %r", hoster_name, upload_resp.text[:200])
         return f"Response Parse Error: {upload_resp.text[:100]}"
 
-    file_code = _extract_filecode(upload_data.get("result"))
+    file_code = _extract_filecode(upload_data)
     if file_code:
         return config["download_url_fmt"].format(code=file_code)
 
+    # upload_data.get('msg') is often just "OK" even on failure (EarnVids
+    # sets top-level msg/status independently of whether files/result
+    # actually contains a usable filecode), so surface the raw payload
+    # rather than a misleadingly reassuring "OK".
     logger.warning("%s: upload failed, response=%r", hoster_name, upload_data)
-    return f"Upload Failed: {upload_data.get('msg', upload_data)}"
+    return f"Upload Failed: no filecode in response ({upload_data})"
 
 
 @app.on_message(filters.private & (filters.video | filters.document))
