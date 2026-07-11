@@ -39,7 +39,7 @@ async def upload_doodstream(client: httpx.AsyncClient, file_path: str):
         with open(file_path, "rb") as f:
             upload_res = await client.post(
                 upload_url, 
-                files={"file": (filename, f)}, 
+                files={"file": (filename, f, "application/octet-stream")}, 
                 data={"api_key": DOODSTREAM_KEY},
                 headers=HEADERS,
                 timeout=None
@@ -51,7 +51,7 @@ async def upload_doodstream(client: httpx.AsyncClient, file_path: str):
                 if result and isinstance(result, list) and len(result) > 0:
                     file_code = result[0].get("filecode") or result[0].get("file_code")
                     if file_code:
-                        return f"https://dood.to/e/{file_code}"
+                        return f"https://dood.to/d/{file_code}"
                 return f"Upload Failed: {upload_data.get('msg', 'Unknown Error')}"
             except Exception:
                 return "Upload Response Invalid"
@@ -78,8 +78,8 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
         with open(file_path, "rb") as f:
             upload_res = await client.post(
                 upload_url, 
-                files={"file": (filename, f)}, 
-                data={"api_key": EARNVIDS_KEY},
+                files={"file": (filename, f, "video/x-matroska")}, 
+                data={"key": EARNVIDS_KEY, "api_key": EARNVIDS_KEY},
                 headers=HEADERS,
                 timeout=None
             )
@@ -90,10 +90,14 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
                 if result and isinstance(result, list) and len(result) > 0:
                     file_code = result[0].get("filecode") or result[0].get("file_code")
                     if file_code:
-                        return f"https://earnvids.com/v/{file_code}"
-                return f"Upload Failed: {upload_data.get('msg', 'Unknown Error')}"
+                        return f"https://earnvids.com/d/{file_code}"
+                elif isinstance(upload_data.get("result"), dict):
+                    file_code = upload_data["result"].get("filecode") or upload_data["result"].get("file_code")
+                    if file_code:
+                        return f"https://earnvids.com/d/{file_code}"
+                return f"Upload Error: {upload_data}"
             except Exception:
-                return "Upload Response Invalid"
+                return f"Response Parse Error: {upload_res.text[:100]}"
     except Exception as e:
         return f"Error: {type(e).__name__}"
 
@@ -117,8 +121,8 @@ async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
         with open(file_path, "rb") as f:
             upload_res = await client.post(
                 upload_url, 
-                files={"file": (filename, f)}, 
-                data={"api_key": STREAMHG_KEY},
+                files={"file": (filename, f, "video/x-matroska")}, 
+                data={"key": STREAMHG_KEY, "api_key": STREAMHG_KEY},
                 headers=HEADERS,
                 timeout=None
             )
@@ -129,10 +133,14 @@ async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
                 if result and isinstance(result, list) and len(result) > 0:
                     file_code = result[0].get("filecode") or result[0].get("file_code")
                     if file_code:
-                        return f"https://streamwish.com/e/{file_code}"
-                return f"Upload Failed: {upload_data.get('msg', 'Unknown Error')}"
+                        return f"https://streamwish.com/f/{file_code}"
+                elif isinstance(upload_data.get("result"), dict):
+                    file_code = upload_data["result"].get("filecode") or upload_data["result"].get("file_code")
+                    if file_code:
+                        return f"https://streamwish.com/f/{file_code}"
+                return f"Upload Error: {upload_data}"
             except Exception:
-                return "Upload Response Invalid"
+                return f"Response Parse Error: {upload_res.text[:100]}"
     except Exception as e:
         return f"Error: {type(e).__name__}"
 
@@ -159,7 +167,7 @@ async def handle_media(client: Client, message: Message):
         os.remove(file_path)
         
     response = (
-        "✅ **Multi-Platform Upload Complete!**\n\n"
+        "✅ **Download Links Ready!**\n\n"
         f"🍿 **Doodstream:** {dood_url}\n"
         f"⚡ **EarnVids:** {earn_url}\n"
         f"🎥 **StreamHG:** {hg_url}"
