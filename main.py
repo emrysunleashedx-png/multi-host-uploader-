@@ -1,8 +1,11 @@
 import os
 import logging
+import asyncio
 import httpx
 from pyrogram import Client, filters
 from pyrogram.types import Message
+
+import firestore_publish
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +30,16 @@ HOSTERS = {
 # Upload network timeout. None (no timeout) risks the bot hanging forever
 # on a stalled connection; use generous but finite limits instead.
 UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
+
+# In-memory pending-publish state, keyed by chat_id. Holds the parsed guess
+# plus the finished Doodstream URL while waiting for the admin to /confirm
+# or /edit it. This is intentionally simple (no persistence) -- if the bot
+# restarts mid-confirmation the admin just re-sends /confirm and gets told
+# there's nothing pending; the uploaded file itself is not lost since it's
+# already on Doodstream by this point, only the Firestore publish step
+# needs re-triggering (which would mean re-running with the link manually
+# added via admin.html, since the pending state doesn't survive a restart).
+PENDING_PUBLISHES = {}
 
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -159,9 +172,32 @@ async def handle_media(client: Client, message: Message):
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
             dood_url = await upload_to_hoster(http_client, "Doodstream", file_path)
 
+        # If the upload itself failed, there's nothing to publish -- just
+        # report the failure as before and stop (no point asking the admin
+        # to confirm a title for a link that doesn't exist).
+        if not dood_url.startswith("http"):
+            await status_msg.edit_text(f"❌ Upload failed: {dood_url}")
+            return
+
+        caption = message.caption or ""
+        guess_title, guess_episode = firestore_publish.parse_title_and_episode(caption)
+
+        PENDING_PUBLISHES[message.chat.id] = {
+            "title": guess_title,
+            "episode": guess_episode,
+            "url": dood_url,
+        }
+
+        title_line = guess_title or "(couldn't guess a title)"
+        episode_line = guess_episode or "(none detected)"
         response = (
-            "✅ **Download Link Ready!**\n\n"
-            f"🍿 **Doodstream:** {dood_url}"
+            "✅ **Upload complete!**\n\n"
+            f"🍿 **Doodstream:** {dood_url}\n\n"
+            "**Ready to publish to the site.** Best guess from the caption:\n"
+            f"• Title: `{title_line}`\n"
+            f"• Episode: `{episode_line}`\n\n"
+            "Reply `/confirm` to publish as-is, or `/edit <title> | <episode>` "
+            "to correct it first (episode is optional, e.g. `/edit The Scarecrow | S01E02`)."
         )
         await status_msg.edit_text(response)
 
@@ -178,10 +214,106 @@ async def handle_media(client: Client, message: Message):
                 logger.warning("Failed to remove temp file %s: %s", file_path, e)
 
 
+@app.on_message(filters.private & filters.command("confirm"))
+async def handle_confirm(client: Client, message: Message):
+    pending = PENDING_PUBLISHES.pop(message.chat.id, None)
+    if not pending:
+        await message.reply_text("Nothing pending to confirm. Upload a file first.")
+        return
+
+    if not pending["title"]:
+        await message.reply_text(
+            "No title could be guessed for this upload, so it can't be confirmed "
+            "as-is. Use `/edit <title> | <episode>` instead."
+        )
+        # Put it back so the admin doesn't lose the finished upload link.
+        PENDING_PUBLISHES[message.chat.id] = pending
+        return
+
+    await _do_publish(message, pending)
+
+
+@app.on_message(filters.private & filters.command("edit"))
+async def handle_edit(client: Client, message: Message):
+    pending = PENDING_PUBLISHES.get(message.chat.id)
+    if not pending:
+        await message.reply_text("Nothing pending to edit. Upload a file first.")
+        return
+
+    # Usage: /edit <title> | <episode>   (episode part is optional)
+    raw = message.text.split(None, 1)
+    args = raw[1] if len(raw) > 1 else ""
+    if not args.strip():
+        await message.reply_text(
+            "Usage: `/edit <title> | <episode>` -- e.g. `/edit The Scarecrow | S01E02` "
+            "(you can omit `| <episode>` if there isn't one)."
+        )
+        return
+
+    if "|" in args:
+        title_part, episode_part = args.split("|", 1)
+        title = title_part.strip()
+        episode = episode_part.strip() or None
+    else:
+        title = args.strip()
+        episode = pending.get("episode")
+
+    if not title:
+        await message.reply_text("Title can't be empty.")
+        return
+
+    pending["title"] = title
+    pending["episode"] = episode
+    PENDING_PUBLISHES[message.chat.id] = pending
+
+    await message.reply_text(
+        f"Updated. Title: `{title}` | Episode: `{episode or '(none)'}`\n"
+        "Reply `/confirm` to publish, or `/edit` again to change it further."
+    )
+
+
+async def _do_publish(message: Message, pending: dict):
+    status = await message.reply_text("📡 Publishing to the site...")
+    try:
+        # firestore_publish does blocking network calls (google-cloud-firestore
+        # is sync), so run it in a thread to avoid stalling the event loop.
+        result = await asyncio.to_thread(
+            firestore_publish.publish_doodstream_link,
+            pending["title"],
+            pending["episode"],
+            pending["url"],
+        )
+        action = result["action"]
+        if action == "created":
+            text = f"✅ Published as a **new** entry: `{pending['title']}`"
+        elif action == "appended":
+            text = f"✅ Added **{pending['episode'] or 'link'}** to existing entry: `{pending['title']}`"
+        else:
+            text = f"ℹ️ This link was already published for `{pending['title']}` — skipped duplicate."
+        await status.edit_text(text)
+    except Exception as e:
+        logger.exception("Failed to publish to Firestore")
+        await status.edit_text(
+            f"❌ Publish failed: {type(e).__name__}: {e}\n\n"
+            "The Doodstream upload itself is fine -- you can add it manually "
+            "in admin.html using the link above."
+        )
+
+
 if __name__ == "__main__":
     import http.server
     import socketserver
     import threading
+
+    # Fail fast and loud at startup if Firebase isn't configured, rather
+    # than only discovering it when the first admin tries to /confirm.
+    try:
+        firestore_publish.init_firebase()
+    except Exception as e:
+        logger.error("Firebase init failed: %s", e)
+        logger.error("The bot will still run and uploads/Doodstream will "
+                      "still work, but /confirm and /edit will fail until "
+                      "FIREBASE_SERVICE_ACCOUNT_PATH is fixed.")
 
     def run_dummy_server():
         # Some hosting platforms (e.g. Render, Railway) require a bound port
