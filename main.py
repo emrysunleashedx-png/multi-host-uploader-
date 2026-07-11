@@ -11,7 +11,6 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 DOODSTREAM_KEY = os.getenv("DOODSTREAM_API_KEY", "")
 EARNVIDS_KEY = os.getenv("EARNVIDS_API_KEY", "")
-STREAMHG_KEY = os.getenv("STREAMHG_API_KEY", "")
 
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -109,53 +108,6 @@ async def upload_earnvids(client: httpx.AsyncClient, file_path: str):
     except Exception as e:
         return f"Error: {type(e).__name__}"
 
-async def upload_streamhg(client: httpx.AsyncClient, file_path: str):
-    if not STREAMHG_KEY:
-        return "Key Missing ⚠️"
-    try:
-        filename = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
-        url = f"https://streamwish.com/api/upload/server?key={STREAMHG_KEY}"
-        res = await client.get(url, headers=HEADERS)
-        
-        try:
-            res_data = res.json()
-        except Exception:
-            return f"API Error (HTTP {res.status_code})"
-
-        upload_url = res_data.get("result")
-        if not upload_url:
-            return f"Server Error: {res_data.get('msg', 'No Upload URL')}"
-
-        data = {
-            "api_key": STREAMHG_KEY,
-            "key": STREAMHG_KEY,
-            "file_size": str(file_size)
-        }
-
-        with open(file_path, "rb") as f:
-            files = {"file": (filename, f, "application/octet-stream")}
-            upload_res = await client.post(
-                f"{upload_url}?key={STREAMHG_KEY}", 
-                files=files, 
-                data=data,
-                headers=HEADERS,
-                timeout=None
-            )
-            
-            try:
-                upload_data = upload_res.json()
-                files_res = upload_data.get("files", upload_data.get("result", []))
-                if isinstance(files_res, list) and len(files_res) > 0:
-                    file_code = files_res[0].get("filecode") or files_res[0].get("file_code")
-                    if file_code:
-                        return f"https://streamwish.com/f/{file_code}"
-                return f"Upload Error: {upload_data}"
-            except Exception:
-                return f"Response Parse Error: {upload_res.text[:100]}"
-    except Exception as e:
-        return f"Error: {type(e).__name__}"
-
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_media(client: Client, message: Message):
     status_msg = await message.reply_text("📥 Downloading file from Telegram...")
@@ -166,14 +118,11 @@ async def handle_media(client: Client, message: Message):
         return
 
     async with httpx.AsyncClient(timeout=None, follow_redirects=True) as http_client:
-        await status_msg.edit_text("🚀 Uploading to Doodstream (1/3)...")
+        await status_msg.edit_text("🚀 Uploading to Doodstream (1/2)...")
         dood_url = await upload_doodstream(http_client, file_path)
         
-        await status_msg.edit_text("🚀 Uploading to EarnVids (2/3)...")
+        await status_msg.edit_text("🚀 Uploading to EarnVids (2/2)...")
         earn_url = await upload_earnvids(http_client, file_path)
-        
-        await status_msg.edit_text("🚀 Uploading to StreamHG (3/3)...")
-        hg_url = await upload_streamhg(http_client, file_path)
         
     if os.path.exists(file_path):
         os.remove(file_path)
@@ -181,8 +130,7 @@ async def handle_media(client: Client, message: Message):
     response = (
         "✅ **Download Links Ready!**\n\n"
         f"🍿 **Doodstream:** {dood_url}\n"
-        f"⚡ **EarnVids:** {earn_url}\n"
-        f"🎥 **StreamHG:** {hg_url}"
+        f"⚡ **EarnVids:** {earn_url}"
     )
     await status_msg.edit_text(response)
 
@@ -198,4 +146,3 @@ if __name__ == "__main__":
             
     threading.Thread(target=run_dummy_server, daemon=True).start()
     app.run()
-
