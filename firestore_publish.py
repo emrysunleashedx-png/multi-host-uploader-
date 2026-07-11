@@ -179,8 +179,16 @@ def build_link_entry(episode: str, server: str, url: str) -> dict:
 
 def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
                              server_label: str = "Doodstream",
-                             category: str = "series") -> dict:
+                             category: str = "series",
+                             extra_fields: dict = None) -> dict:
     """Create-or-append the finished Doodstream link into Firestore.
+
+    extra_fields, if given, is merged into a *newly created* doc only
+    (e.g. TMDB-fetched poster/description/genre/cast/etc. -- see
+    tmdb_fetch.py). It is intentionally NOT applied when appending to an
+    existing series, so re-confirming an episode for an already-published
+    series never silently overwrites admin-edited fields like a
+    hand-picked poster or corrected synopsis.
 
     Returns a dict describing what happened, e.g.:
         {"action": "appended", "doc_id": "...", "slug": "..."}
@@ -218,10 +226,10 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
                     doc_ref.id, slug, episode)
         return {"action": "appended", "doc_id": doc_ref.id, "slug": slug}
 
-    # No existing series found -- create a minimal new doc. Admin can (and
-    # likely should) go into admin.html afterwards to fill in poster,
-    # description, genres, etc. We only set the fields required for the
-    # site to render *something* sensible and for future matching to work.
+    # No existing series found -- create a new doc. Start from the minimal
+    # defaults, then layer any TMDB-fetched fields on top so poster/genre/
+    # cast/etc. are pre-filled when available, matching what admin.html's
+    # "Auto-fetch from TMDB" button would have produced by hand.
     payload = {
         "title": title,
         "slug": slug,
@@ -240,6 +248,19 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
         "directLinks": [new_link],
         "timestamp": _firestore.SERVER_TIMESTAMP,
     }
+    if extra_fields:
+        # Only accept known/expected keys -- never let an unexpected key
+        # from a TMDB response shape change accidentally clobber something
+        # like `slug` or `directLinks` computed just above.
+        allowed_keys = {
+            "title", "year", "image", "backdrop", "description", "duration",
+            "genre", "genres", "trailer", "director", "contentRating",
+            "voteAverage", "cast", "language",
+        }
+        for key, value in extra_fields.items():
+            if key in allowed_keys and value not in (None, "", []):
+                payload[key] = value
+
     _, doc_ref = db.collection(ROOT_COLLECTION).add(payload)
     logger.info("Created new doc %s for title=%r (slug=%s)", doc_ref.id, title, slug)
     return {"action": "created", "doc_id": doc_ref.id, "slug": slug}
