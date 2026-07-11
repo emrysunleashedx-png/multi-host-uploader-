@@ -167,6 +167,72 @@ def parse_title_and_episode(caption: str):
     return title or None, episode
 
 
+_EPISODE_RE = re.compile(r"^S(\d{1,2})E(\d{1,3})$", re.IGNORECASE)
+
+
+def infer_next_episode(title: str) -> str:
+    """If `title` matches an existing series in Firestore, look at its
+    current directLinks and guess the next sequential episode number
+    (e.g. if S01E03 is the highest existing episode, guess S01E04).
+
+    Deliberately conservative: only used when the source text had NO
+    episode marker at all (see bot_fixed.py's caller) -- if a filename
+    already says S01E05, that explicit value always wins over any guess.
+    Returns "" (meaning "no guess") if:
+      - no matching series exists yet (nothing to infer from)
+      - the existing series has no parseable S##E## episodes (e.g. it's
+        actually a movie, or uses a numbering scheme this doesn't
+        recognize) -- guessing wrong here would mislabel content, so we
+        simply decline to guess rather than risk it.
+    """
+    db = _db or init_firebase()
+    slug = slugify(title)
+    if not slug:
+        return ""
+
+    existing = find_series_by_slug(db, slug)
+    if not existing:
+        return ""
+
+    data = existing.to_dict() or {}
+    links = data.get("directLinks", []) or []
+
+    best_season, best_episode = None, None
+    for link in links:
+        match = _EPISODE_RE.match((link.get("episode") or "").strip())
+        if not match:
+            continue
+        season_num, episode_num = int(match.group(1)), int(match.group(2))
+        if best_season is None or (season_num, episode_num) > (best_season, best_episode):
+            best_season, best_episode = season_num, episode_num
+
+    if best_season is None:
+        return ""
+
+    return f"S{best_season:02d}E{best_episode + 1:02d}"
+
+
+
+
+
+def detect_quality(source_text: str) -> str:
+    """Best-effort video quality detection from a filename/caption, e.g.
+    'Kangchi.The.Beginning.S01E01.1080p.mkv' -> '1080p'. Returns '' if no
+    recognizable quality tag is found -- callers should treat that as
+    'unknown', not 'definitely not 1080p', since plenty of uploads simply
+    don't mention quality in the filename at all.
+    """
+    if not source_text:
+        return ""
+    match = re.search(r"\b(2160p|4k|1080p|720p|480p)\b", source_text, re.IGNORECASE)
+    if not match:
+        return ""
+    tag = match.group(1).lower()
+    if tag == "4k":
+        return "2160p"
+    return tag
+
+
 def find_series_by_slug(db, slug: str):
     """Look up an existing movies/ doc by its stored slug field."""
     query = db.collection(ROOT_COLLECTION).where("slug", "==", slug).limit(1)
@@ -258,6 +324,62 @@ def search_titles(query: str, limit: int = 8) -> list:
     return results
 
 
+# Field name -> emoji shown in admin.html's list view (see the flags.push()
+# lines in js/admin.js), used to make bot confirmations recognizable
+# against what you'd see in the admin panel itself.
+TOGGLEABLE_FLAGS = {
+    "featured": ("isFeatured", "⭐"),
+    "trending": ("isTrending", "🔥"),
+    "new": ("isNewRelease", "🆕"),
+    "recommended": ("isRecommended", "👍"),
+}
+
+
+def toggle_flag(title: str, flag_name: str, value: bool = None) -> dict:
+    """Set (or flip) one of the admin.html quick-toggle booleans
+    (isFeatured / isTrending / isNewRelease / isRecommended) on a
+    published title, found by exact title match via its slug.
+
+    flag_name must be one of TOGGLEABLE_FLAGS' keys ("featured",
+    "trending", "new", "recommended") -- NOT the raw Firestore field name,
+    so the bot-facing command surface stays readable without needing to
+    know Firestore's internal field naming.
+
+    If value is None, flips whatever the current value is. If value is
+    True/False, sets it explicitly regardless of the current value.
+
+    Returns {"found": False} if no matching title exists, or
+            {"found": True, "title": "...", "field": "...", "new_value": bool}
+    """
+    if flag_name not in TOGGLEABLE_FLAGS:
+        raise ValueError(f"Unknown flag {flag_name!r}, must be one of {list(TOGGLEABLE_FLAGS)}")
+
+    field_name, _ = TOGGLEABLE_FLAGS[flag_name]
+    db = _db or init_firebase()
+
+    slug = slugify(title)
+    if not slug:
+        return {"found": False}
+
+    existing = find_series_by_slug(db, slug)
+    if not existing:
+        return {"found": False}
+
+    data = existing.to_dict() or {}
+    current = bool(data.get(field_name, False))
+    new_value = (not current) if value is None else bool(value)
+
+    existing.reference.update({field_name: new_value})
+    logger.info("Toggled %s on doc %s (title=%r) to %s", field_name, existing.id, title, new_value)
+
+    return {
+        "found": True,
+        "title": data.get("title", title),
+        "field": field_name,
+        "new_value": new_value,
+    }
+
+
 def build_link_entry(episode: str, server: str, url: str) -> dict:
     """Match the exact shape js/admin.js: collectDirectLinks() produces,
     so entries the bot writes render identically in the admin panel.
@@ -280,10 +402,15 @@ def format_links_block(links: list) -> str:
     js/admin.js: generateSynopsisFromBuilder() -- NOT the whole function,
     just the part that turns directLinks rows into text lines:
         S01E01
-        Doodstream: https://dood.to/d/abc
-        Doodstream: https://dood.to/d/xyz   (no repeated episode line
-                                              if it matches the previous row)
+        Download link: https://dood.to/d/abc
+        Download link: https://dood.to/d/xyz   (no repeated episode line
+                                                  if it matches the previous row)
     Rows without a URL are skipped, matching the JS's `if (!url) return;`.
+
+    The label is always "Download link" rather than the hoster's actual
+    name (e.g. "Doodstream") -- this is a display choice for the site's
+    synopsis text, independent of the `server` field itself, which still
+    stores the real hoster name for any other logic that needs it.
     """
     lines = []
     last_episode = None
@@ -292,11 +419,10 @@ def format_links_block(links: list) -> str:
         if not url:
             continue
         episode = (link.get("episode") or "").strip()
-        server = (link.get("server") or "").strip()
         if episode and episode != last_episode:
             lines.append(episode)
             last_episode = episode
-        lines.append(f"{server}: {url}" if server else url)
+        lines.append(f"Download link: {url}")
     return "\n".join(lines)
 
 
@@ -345,8 +471,16 @@ def rebuild_description_with_links(existing_description: str, links: list) -> st
 def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
                              server_label: str = "Doodstream",
                              category: str = "series",
-                             extra_fields: dict = None) -> dict:
+                             extra_fields: dict = None,
+                             quality: str = "") -> dict:
     """Create-or-append the finished Doodstream link into Firestore.
+
+    quality, if given (e.g. "1080p" from detect_quality()), sets the
+    p1080 badge field. On an existing doc, p1080 is only ever upgraded
+    (False -> True), never downgraded -- the badge represents "1080p is
+    available for this title", and an admin-confirmed 1080p episode
+    shouldn't get quietly reset to False just because a later episode's
+    filename didn't happen to mention quality.
 
     extra_fields, if given, is merged into a *newly created* doc only
     (e.g. TMDB-fetched poster/description/genre/cast/etc. -- see
@@ -387,7 +521,17 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
 
         links.append(new_link)
         new_description = rebuild_description_with_links(data.get("description", ""), links)
-        doc_ref.update({"directLinks": links, "description": new_description})
+        update_payload = {"directLinks": links, "description": new_description}
+
+        # Upgrade-only: set p1080 True if this upload is 1080p+ and the
+        # doc doesn't already have it set, but never flip an existing
+        # True back to False just because this particular episode's
+        # filename didn't mention quality.
+        is_1080_or_better = quality in ("1080p", "2160p")
+        if is_1080_or_better and not data.get("p1080"):
+            update_payload["p1080"] = True
+
+        doc_ref.update(update_payload)
         logger.info("Appended link to existing doc %s (slug=%s, episode=%s)",
                     doc_ref.id, slug, episode)
         return {"action": "appended", "doc_id": doc_ref.id, "slug": slug}
@@ -405,7 +549,7 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
         "size": "",
         "genre": "",
         "description": "",
-        "p1080": False,
+        "p1080": quality in ("1080p", "2160p"),
         "isFeatured": False,
         "isTrending": False,
         "isNewRelease": True,
@@ -435,4 +579,3 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     _, doc_ref = db.collection(ROOT_COLLECTION).add(payload)
     logger.info("Created new doc %s for title=%r (slug=%s)", doc_ref.id, title, slug)
     return {"action": "created", "doc_id": doc_ref.id, "slug": slug}
-
