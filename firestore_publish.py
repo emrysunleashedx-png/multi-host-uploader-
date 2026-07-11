@@ -43,6 +43,13 @@ logger = logging.getLogger("firestore_publish")
 
 ROOT_COLLECTION = "movies"
 
+# Marks the start of the bot-managed "episode/server/link" block appended
+# to a doc's description field (mirrors what admin.html's "Generate
+# Synopsis" button builds by hand -- see format_links_block below). Text
+# above this marker is left alone on every publish; everything from the
+# marker down is fully rebuilt from the current directLinks each time.
+_LINKS_MARKER = "— Links —"
+
 _app = None
 _db = None
 _firebase_admin = None
@@ -184,6 +191,73 @@ def build_link_entry(episode: str, server: str, url: str) -> dict:
     }
 
 
+def format_links_block(links: list) -> str:
+    """Python port of the line-building loop inside
+    js/admin.js: generateSynopsisFromBuilder() -- NOT the whole function,
+    just the part that turns directLinks rows into text lines:
+        S01E01
+        Doodstream: https://dood.to/d/abc
+        Doodstream: https://dood.to/d/xyz   (no repeated episode line
+                                              if it matches the previous row)
+    Rows without a URL are skipped, matching the JS's `if (!url) return;`.
+    """
+    lines = []
+    last_episode = None
+    for link in links:
+        url = (link.get("sourceUrl") or "").strip()
+        if not url:
+            continue
+        episode = (link.get("episode") or "").strip()
+        server = (link.get("server") or "").strip()
+        if episode and episode != last_episode:
+            lines.append(episode)
+            last_episode = episode
+        lines.append(f"{server}: {url}" if server else url)
+    return "\n".join(lines)
+
+
+def build_full_description(tmdb_synopsis: str, links: list) -> str:
+    """Build the initial description for a brand-new doc: TMDB synopsis
+    (if any), then the marked bot-managed links block. Uses the same
+    _LINKS_MARKER as rebuild_description_with_links so later episode
+    appends can find and replace this block instead of accumulating a
+    second, duplicate copy of it.
+    """
+    return rebuild_description_with_links(tmdb_synopsis, links)
+
+
+def rebuild_description_with_links(existing_description: str, links: list) -> str:
+    """Rebuild the description's auto-generated links block from the
+    complete current set of directLinks, replacing any block this bot
+    previously appended rather than piling up a fresh copy on every new
+    episode.
+
+    admin.html's own "Generate Synopsis" button doesn't guard against this
+    at all -- clicking it repeatedly just keeps re-appending -- but since
+    the bot calls this automatically on every single confirmed upload,
+    blindly porting that same behavior would visibly duplicate the whole
+    links list every time a new episode is added. Instead, everything
+    below a fixed marker line is treated as bot-managed and fully
+    replaced; everything above it (the TMDB synopsis, or anything the
+    admin typed by hand) is left untouched.
+    """
+    marker = "\n\n" + _LINKS_MARKER + "\n"
+    existing = existing_description or ""
+
+    if _LINKS_MARKER in existing:
+        prose_part = existing.split(_LINKS_MARKER, 1)[0].rstrip()
+    else:
+        prose_part = existing.strip()
+
+    links_block = format_links_block(links)
+    if not links_block:
+        return prose_part
+
+    if prose_part:
+        return f"{prose_part}{marker}{links_block}"
+    return f"{_LINKS_MARKER}\n{links_block}"
+
+
 def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
                              server_label: str = "Doodstream",
                              category: str = "series",
@@ -228,7 +302,8 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
             return {"action": "skipped_duplicate", "doc_id": doc_ref.id, "slug": slug}
 
         links.append(new_link)
-        doc_ref.update({"directLinks": links})
+        new_description = rebuild_description_with_links(data.get("description", ""), links)
+        doc_ref.update({"directLinks": links, "description": new_description})
         logger.info("Appended link to existing doc %s (slug=%s, episode=%s)",
                     doc_ref.id, slug, episode)
         return {"action": "appended", "doc_id": doc_ref.id, "slug": slug}
@@ -267,6 +342,11 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
         for key, value in extra_fields.items():
             if key in allowed_keys and value not in (None, "", []):
                 payload[key] = value
+
+    # Build the initial description exactly like admin.html's "Generate
+    # Synopsis" button would: TMDB synopsis (if any) followed by the
+    # formatted episode/link block for this first upload.
+    payload["description"] = build_full_description(payload.get("description", ""), payload["directLinks"])
 
     _, doc_ref = db.collection(ROOT_COLLECTION).add(payload)
     logger.info("Created new doc %s for title=%r (slug=%s)", doc_ref.id, title, slug)
