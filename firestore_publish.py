@@ -174,6 +174,90 @@ def find_series_by_slug(db, slug: str):
     return results[0] if results else None
 
 
+def check_existing_episode(title: str, episode: str) -> dict:
+    """Check whether a title/episode is already published, BEFORE
+    downloading or uploading anything -- avoids wasting Telegram download
+    time and Doodstream upload bandwidth on a file that's already on the
+    site.
+
+    This is intentionally a lighter-weight check than the one inside
+    publish_doodstream_link (which also matches by exact sourceUrl, since
+    that's only knowable after a Doodstream URL already exists). Here we
+    can only go by title+episode, since that's all that's available
+    before the file has been uploaded anywhere.
+
+    Returns {"exists": False} or
+            {"exists": True, "doc_id": "...", "title": "...",
+             "episode": "..." } for the caller to show the admin.
+    """
+    db = _db or init_firebase()
+
+    slug = slugify(title)
+    if not slug:
+        return {"exists": False}
+
+    existing = find_series_by_slug(db, slug)
+    if not existing:
+        return {"exists": False}
+
+    data = existing.to_dict() or {}
+    links = data.get("directLinks", []) or []
+
+    # A movie (no episode) matching an existing slug is itself a duplicate
+    # of the whole entry, not just one link within it.
+    if not episode:
+        return {"exists": True, "doc_id": existing.id, "title": data.get("title", title), "episode": None}
+
+    for link in links:
+        if link.get("episode") == episode:
+            return {"exists": True, "doc_id": existing.id, "title": data.get("title", title), "episode": episode}
+
+    return {"exists": False}
+
+
+def search_titles(query: str, limit: int = 8) -> list:
+    """Find published movies/series whose title contains the query text
+    (case-insensitive, substring match).
+
+    Firestore has no native full-text/substring search, so this fetches
+    title+slug+category+directLinks for the whole collection and filters
+    in Python. That's fine at the catalog sizes this bot is designed for
+    (a personal/small-team upload pipeline, not a large streaming site's
+    full library) but would need a real search index (Algolia, Typesense,
+    Firestore's array-contains tricks, etc.) if the catalog grows into
+    the thousands+ range -- worth revisiting if /find starts feeling slow.
+
+    Returns a list of dicts: [{"title", "slug", "category", "episode_count"}, ...]
+    """
+    db = _db or init_firebase()
+    query_lower = query.strip().lower()
+    if not query_lower:
+        return []
+
+    results = []
+    # Only pull the fields actually needed for display, not full docs
+    # (poster/description/cast etc aren't needed just to list matches).
+    docs = db.collection(ROOT_COLLECTION).select(
+        ["title", "slug", "category", "directLinks"]
+    ).stream()
+
+    for doc in docs:
+        data = doc.to_dict() or {}
+        title = data.get("title", "")
+        if query_lower in title.lower():
+            links = data.get("directLinks", []) or []
+            results.append({
+                "title": title,
+                "slug": data.get("slug", ""),
+                "category": data.get("category", ""),
+                "episode_count": len(links),
+            })
+        if len(results) >= limit:
+            break
+
+    return results
+
+
 def build_link_entry(episode: str, server: str, url: str) -> dict:
     """Match the exact shape js/admin.js: collectDirectLinks() produces,
     so entries the bot writes render identically in the admin panel.
