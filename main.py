@@ -180,8 +180,19 @@ async def handle_media(client: Client, message: Message):
             await status_msg.edit_text(f"❌ Upload failed: {dood_url}")
             return
 
-        caption = message.caption or ""
-        guess_title, guess_episode = firestore_publish.parse_title_and_episode(caption)
+        # Captions aren't always populated the same way -- forwarded
+        # documents in particular often carry the real title/episode info
+        # in the filename instead of (or in addition to) the caption.
+        # Prefer the caption if present (it's usually cleaner / hand-typed
+        # by the source channel), but fall back to the filename so a
+        # caption-less forward like "Kangchi.The.Beginning.S01E01.mkv"
+        # still gets parsed instead of guessing nothing at all.
+        filename = getattr(message.document, "file_name", None) or \
+                   getattr(message.video, "file_name", None) or ""
+        source_text = (message.caption or "").strip() or filename
+        logger.info("Parsing title/episode from source_text=%r (caption=%r, filename=%r)",
+                    source_text, message.caption, filename)
+        guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
 
         PENDING_PUBLISHES[message.chat.id] = {
             "title": guess_title,
@@ -455,3 +466,4 @@ if __name__ == "__main__":
 
     threading.Thread(target=run_dummy_server, daemon=True).start()
     app.run()
+
