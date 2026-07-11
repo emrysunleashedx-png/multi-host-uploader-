@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 import httpx
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -23,11 +22,6 @@ HOSTERS = {
         "server_url": "https://doodapi.com/api/upload/server",
         "download_url_fmt": "https://dood.to/d/{code}",
     },
-    "EarnVids": {
-        "api_key": os.getenv("EARNVIDS_API_KEY", ""),
-        "server_url": "https://earnvids.com/api/upload/server",
-        "download_url_fmt": "https://earnvids.com/d/{code}",
-    },
 }
 
 # Upload network timeout. None (no timeout) risks the bot hanging forever
@@ -49,35 +43,16 @@ def _extract_filecode_from_entry(entry):
 
 
 def _extract_filecode(upload_data):
-    """Extract the filecode from an upload response.
+    """Extract the filecode from a Doodstream upload response.
 
-    Per EarnVids' documented API (earnvids.com/api.html), a successful file
-    upload response looks like:
-        {"msg": "OK", "status": 200,
-         "files": [{"filecode": "...", "filename": "...", "status": "OK"}]}
-    i.e. the list lives under the top-level "files" key, not "result".
-
-    Doodstream (and possibly EarnVids servers that drift from their own
-    docs) have been observed returning the filecode under "result" instead,
-    as either a list or a single dict. We check the documented shape first,
-    then fall back to the "result"-based shape for compatibility.
+    Doodstream returns the filecode under top-level "result", as either a
+    list of dicts or a single dict, using either "filecode" or "file_code"
+    as the key depending on server instance.
     """
-    # Documented shape: top-level "files" list.
-    files = upload_data.get("files")
-    if isinstance(files, list) and files:
-        code = _extract_filecode_from_entry(files[0])
-        if code:
-            return code
-
-    # Fallback shape: top-level "result", either list or dict.
     result = upload_data.get("result")
     if isinstance(result, list) and result:
         result = result[0]
-    code = _extract_filecode_from_entry(result)
-    if code:
-        return code
-
-    return None
+    return _extract_filecode_from_entry(result)
 
 
 async def upload_to_hoster(client: httpx.AsyncClient, hoster_name: str, file_path: str) -> str:
@@ -116,11 +91,8 @@ async def upload_to_hoster(client: httpx.AsyncClient, hoster_name: str, file_pat
     if not upload_url:
         return f"Server Error: {server_data.get('msg', 'No Upload URL')}"
 
-    # Per EarnVids' documented API, the upload POST only needs "key" (not
-    # "api_key", no repeated query-string key, no file_size param).
-    # Doodstream's docs use "api_key" as the form field name instead.
-    key_field = "key" if hoster_name == "EarnVids" else "api_key"
-    extra_data = {key_field: api_key}
+    # Doodstream's API expects the form field name "api_key".
+    extra_data = {"api_key": api_key}
 
     try:
         # Reading the file happens inside a worker thread via to_thread so we
@@ -157,10 +129,9 @@ async def upload_to_hoster(client: httpx.AsyncClient, hoster_name: str, file_pat
     if file_code:
         return config["download_url_fmt"].format(code=file_code)
 
-    # upload_data.get('msg') is often just "OK" even on failure (EarnVids
-    # sets top-level msg/status independently of whether files/result
-    # actually contains a usable filecode), so surface the raw payload
-    # rather than a misleadingly reassuring "OK".
+    # upload_data.get('msg') can be a reassuring "OK" even when result/files
+    # doesn't actually contain a usable filecode, so surface the raw payload
+    # rather than that misleading top-level message.
     logger.warning("%s: upload failed, response=%r", hoster_name, upload_data)
     return f"Upload Failed: no filecode in response ({upload_data})"
 
@@ -183,18 +154,14 @@ async def handle_media(client: Client, message: Message):
         return
 
     try:
-        await status_msg.edit_text("🚀 Uploading to Doodstream & EarnVids in parallel...")
+        await status_msg.edit_text("🚀 Uploading to Doodstream...")
 
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
-            # Run both uploads concurrently instead of sequentially.
-            dood_task = upload_to_hoster(http_client, "Doodstream", file_path)
-            earn_task = upload_to_hoster(http_client, "EarnVids", file_path)
-            dood_url, earn_url = await asyncio.gather(dood_task, earn_task)
+            dood_url = await upload_to_hoster(http_client, "Doodstream", file_path)
 
         response = (
-            "✅ **Download Links Ready!**\n\n"
-            f"🍿 **Doodstream:** {dood_url}\n"
-            f"⚡ **EarnVids:** {earn_url}"
+            "✅ **Download Link Ready!**\n\n"
+            f"🍿 **Doodstream:** {dood_url}"
         )
         await status_msg.edit_text(response)
 
