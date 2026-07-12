@@ -297,6 +297,18 @@ def _is_trusted_torrent_handoff(message: Message) -> bool:
 
 @app.on_message(filters.group & filters.text)
 async def handle_torrent_handoff(client: Client, message: Message):
+    # TEMPORARY diagnostic logging -- unconditional, runs before the trust
+    # check, specifically to answer "is this handler even being invoked,
+    # and if so, why does the trust check reject it?" Remove once the
+    # group handoff is confirmed working reliably.
+    logger.info(
+        "handle_torrent_handoff invoked: chat.id=%r (expected %r), "
+        "from_user.id=%r (expected %r), text_startswith_marker=%r",
+        message.chat.id, PIPELINE_GROUP_ID,
+        message.from_user.id if message.from_user else None, TRUSTED_TORRENT_BOT_ID,
+        (message.text or "").strip().startswith(DOODSTREAM_LINK_MARKER),
+    )
+
     if not _is_trusted_torrent_handoff(message):
         return  # not our marker, not our bot, or not our group -- ignore silently
 
