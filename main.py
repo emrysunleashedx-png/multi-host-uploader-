@@ -39,6 +39,20 @@ UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
 # the LARGE_FILE_WARNING_GB env var if this default doesn't fit your usage.
 LARGE_FILE_WARNING_BYTES = int(float(os.getenv("LARGE_FILE_WARNING_GB", "1.5")) * 1024 ** 3)
 
+# The shared Telegram group both this bot and the separate Torrent Fetcher
+# bot are members of, and that fetcher bot's numeric Telegram user ID.
+# Messages in this group are only ever acted on if they come from exactly
+# this bot ID -- never from other group members, even the admin typing
+# directly in the group -- so a random group message can't accidentally
+# trigger a fake "publish this link" flow.
+PIPELINE_GROUP_ID = int(os.getenv("PIPELINE_GROUP_ID", "-1004319667086"))
+TRUSTED_TORRENT_BOT_ID = int(os.getenv("TRUSTED_TORRENT_BOT_ID", "8681574078"))
+
+# Fixed marker line the Torrent Fetcher bot puts at the top of its handoff
+# message so this bot can recognize "this text message is a finished
+# torrent upload" versus any other text in the group.
+DOODSTREAM_LINK_MARKER = "DOODSTREAM_LINK"
+
 # In-memory pending-publish state, keyed by chat_id. Holds the parsed guess
 # plus the finished Doodstream URL while waiting for the admin to /confirm
 # or /edit it. This is intentionally simple (no persistence) -- if the bot
@@ -264,6 +278,119 @@ async def _parse_source_and_infer_episode(message: Message):
             episode_was_inferred = True
 
     return guess_title, guess_episode, source_text, episode_was_inferred
+
+
+def _is_trusted_torrent_handoff(message: Message) -> bool:
+    """True only for messages in the shared pipeline group, sent by
+    exactly the trusted Torrent Fetcher bot ID, containing the expected
+    handoff marker. Every one of these conditions must hold -- this is
+    the only thing standing between "trusted automated handoff" and
+    "anyone in the group could type a fake link and get it published".
+    """
+    if message.chat.id != PIPELINE_GROUP_ID:
+        return False
+    if not message.from_user or message.from_user.id != TRUSTED_TORRENT_BOT_ID:
+        return False
+    text = message.text or ""
+    return text.strip().startswith(DOODSTREAM_LINK_MARKER)
+
+
+@app.on_message(filters.group & filters.text)
+async def handle_torrent_handoff(client: Client, message: Message):
+    if not _is_trusted_torrent_handoff(message):
+        return  # not our marker, not our bot, or not our group -- ignore silently
+
+    lines = [l.strip() for l in message.text.strip().splitlines() if l.strip()]
+    # Expected shape:
+    #   DOODSTREAM_LINK
+    #   https://dood.to/d/abc123
+    #   Original.Torrent.Or.File.Name.S01E01.1080p
+    if len(lines) < 2 or not lines[1].startswith("http"):
+        logger.warning("Malformed torrent handoff message, ignoring: %r", message.text)
+        return
+
+    dood_url = lines[1]
+    source_text = lines[2] if len(lines) > 2 else ""
+
+    logger.info("Received torrent handoff: url=%r source_text=%r", dood_url, source_text)
+
+    guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
+    episode_was_inferred = False
+    if guess_title and not guess_episode:
+        try:
+            inferred = await asyncio.to_thread(firestore_publish.infer_next_episode, guess_title)
+        except Exception as e:
+            logger.warning("Episode inference failed for torrent handoff: %s", e)
+            inferred = ""
+        if inferred:
+            guess_episode = inferred
+            episode_was_inferred = True
+
+    guess_quality = firestore_publish.detect_quality(source_text)
+
+    # Torrent handoffs skip download/upload entirely (already done by the
+    # other bot) -- go straight to the same pending-confirm state a normal
+    # upload would reach, in THIS bot's own private chat with the admin,
+    # not the group -- /confirm, /edit etc. are private-chat-only commands,
+    # and pending state is keyed by chat_id, so this intentionally uses
+    # the admin's private chat ID, not the group's, as the key.
+    admin_chat_id = _resolve_admin_chat_id()
+    if admin_chat_id is None:
+        logger.error(
+            "Received a torrent handoff but ADMIN_CHAT_ID isn't configured -- "
+            "can't route this into the confirm flow. Set the ADMIN_CHAT_ID env var."
+        )
+        return
+
+    PENDING_PUBLISHES[admin_chat_id] = {
+        "title": guess_title,
+        "episode": guess_episode,
+        "url": dood_url,
+        "year": None,
+        "category": "series" if guess_episode else "movie",
+        "quality": guess_quality,
+        "episode_was_inferred": episode_was_inferred,
+        "tmdb_candidates": None,
+        "tmdb_type": None,
+    }
+
+    title_line = guess_title or "(couldn't guess a title)"
+    if guess_episode and episode_was_inferred:
+        episode_line = f"{guess_episode} (inferred — not in filename, double check this!)"
+    else:
+        episode_line = guess_episode or "(none detected)"
+    category_line = PENDING_PUBLISHES[admin_chat_id]["category"]
+    quality_line = guess_quality or "(not detected)"
+
+    await client.send_message(
+        admin_chat_id,
+        "📦 **Torrent upload received!**\n\n"
+        f"🍿 **Doodstream:** {dood_url}\n\n"
+        "**Ready to publish to the site.** Best guess from the torrent name:\n"
+        f"• Title: `{title_line}`\n"
+        f"• Episode: {episode_line}\n"
+        f"• Category: `{category_line}`\n"
+        f"• Quality: `{quality_line}`\n\n"
+        "Reply `/confirm` to look this up on TMDB and publish, or "
+        "`/edit <title> | <episode> | <year> | <category> | <quality>` to correct it first."
+    )
+
+
+def _resolve_admin_chat_id():
+    """The private chat ID to route torrent handoffs into. Set explicitly
+    via the ADMIN_CHAT_ID env var -- there's no reliable way to derive
+    "the admin's private chat with this bot" automatically from a group
+    message, since group membership doesn't tell us which private chat
+    ID corresponds to the human admin behind it.
+    """
+    raw = os.getenv("ADMIN_CHAT_ID", "")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("ADMIN_CHAT_ID env var is set but not a valid integer: %r", raw)
+        return None
 
 
 @app.on_message(filters.private & (filters.video | filters.document))
