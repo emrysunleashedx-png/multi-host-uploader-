@@ -90,24 +90,6 @@ BATCH_PENDING_PUBLISH = {}
 
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-
-@app.on_raw_update()
-async def log_all_raw_updates(client: Client, update, users, chats):
-    """TEMPORARY diagnostic handler. Pyrogram's on_message() handlers sit
-    on top of a filtering/parsing layer -- if something in that layer is
-    silently failing to construct a Message object for updates from the
-    pipeline group (for any reason, including further Pyrogram bugs),
-    on_message handlers would never fire even though Telegram is genuinely
-    delivering the update. This handler runs on EVERY raw update, before
-    any of that, so its presence or absence tells us definitively whether
-    the group's messages are reaching this client at the transport level
-    at all. Remove once the group handoff is confirmed reliably working.
-    """
-    try:
-        logger.info("RAW UPDATE received: type=%s repr=%.300r", type(update).__name__, update)
-    except Exception as e:
-        logger.warning("RAW UPDATE received but failed to log it: %s", e)
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
