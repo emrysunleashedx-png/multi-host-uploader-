@@ -295,9 +295,32 @@ def _is_trusted_torrent_handoff(message: Message) -> bool:
     return text.strip().startswith(DOODSTREAM_LINK_MARKER)
 
 
-@app.on_message(filters.group & filters.text)
+@app.on_message(filters.text, group=1)
 async def handle_torrent_handoff(client: Client, message: Message):
+    # IMPORTANT: registered with group=1 (not the default group=0 that
+    # every /confirm, /edit, /pick etc. handler uses). Pyrogram only runs
+    # ONE handler per dispatch group per update when filters overlap --
+    # "only the first [registered handler] is executed and any other
+    # handler will be ignored. This is intended by design" (Pyrogram
+    # docs). Since this handler matches bare filters.text, which overlaps
+    # with every private command handler below, putting it in its own
+    # group is required so it runs ALONGSIDE those handlers rather than
+    # silently replacing them for every private message. See "More on
+    # Updates" in Pyrogram's docs for the handler-groups mechanism.
+    #
+    # Also deliberately NOT using filters.group here, on top of that:
+    # filters.group depends on Telegram correctly reporting
+    # message.chat.type as GROUP/SUPERGROUP -- if that classification
+    # ever misreports (e.g. around a basic-group -> supergroup upgrade,
+    # which making a group public can silently trigger), the handler
+    # would never fire, with no error, no log, nothing to go on. Chat ID
+    # is a much more basic, reliable piece of data than chat type
+    # classification, so gating on it directly (inside
+    # _is_trusted_torrent_handoff) is more defensive than trusting
+    # filters.group's classification.
+    #
     # TEMPORARY diagnostic logging -- unconditional, runs before the trust
+
     # check, specifically to answer "is this handler even being invoked,
     # and if so, why does the trust check reject it?" Remove once the
     # group handoff is confirmed working reliably.
