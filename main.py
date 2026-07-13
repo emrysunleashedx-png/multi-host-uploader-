@@ -888,6 +888,44 @@ async def handle_toggle_flag(client: Client, message: Message):
     await message.reply_text(f"{emoji} `{result['title']}` — {command_word} is now **{state_word}**.")
 
 
+@app.on_message(filters.private & filters.command("checkgroup"))
+async def handle_check_group(client: Client, message: Message):
+    """ONE-TIME DIAGNOSTIC command. Bypasses Telegram's update-push
+    system entirely (the layer every previous debugging attempt has
+    depended on) by directly asking Telegram "what messages exist in the
+    pipeline group right now", via get_chat_history(). If this finds the
+    DOODSTREAM_LINK messages that on_message handlers have never fired
+    for, it proves the problem is specifically in update delivery/dispatch
+    for this chat, not in permissions, chat resolution, or anything more
+    fundamental. Safe to leave in permanently (does nothing unless you
+    explicitly run /checkgroup) or remove once the real issue is found.
+    """
+    status = await message.reply_text(f"🔍 Fetching recent history for chat_id={PIPELINE_GROUP_ID} directly...")
+
+    try:
+        chat = await client.get_chat(PIPELINE_GROUP_ID)
+        chat_info = f"type={chat.type}, title={chat.title!r}, id={chat.id}"
+    except Exception as e:
+        await status.edit_text(f"❌ get_chat() failed: {type(e).__name__}: {e}")
+        return
+
+    lines = [f"✅ get_chat() succeeded: {chat_info}", ""]
+
+    try:
+        count = 0
+        async for msg in client.get_chat_history(PIPELINE_GROUP_ID, limit=10):
+            count += 1
+            sender = msg.from_user.id if msg.from_user else "(no from_user)"
+            preview = (msg.text or msg.caption or "(no text)")[:60].replace("\n", " ")
+            lines.append(f"{count}. from={sender} text={preview!r}")
+        if count == 0:
+            lines.append("(get_chat_history returned zero messages)")
+    except Exception as e:
+        lines.append(f"❌ get_chat_history() failed: {type(e).__name__}: {e}")
+
+    await status.edit_text("\n".join(lines))
+
+
 @app.on_message(filters.private & filters.command("help"))
 async def handle_help(client: Client, message: Message):
     await message.reply_text(
