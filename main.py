@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 import httpx
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 import firestore_publish
@@ -46,6 +46,14 @@ LARGE_FILE_WARNING_BYTES = int(float(os.getenv("LARGE_FILE_WARNING_GB", "1.5")) 
 # directly in the group -- so a random group message can't accidentally
 # trigger a fake "publish this link" flow.
 PIPELINE_GROUP_ID = int(os.getenv("PIPELINE_GROUP_ID", "-1004319667086"))
+# The group's public @username, used ONLY to force Pyrogram to resolve
+# and cache this chat's peer at startup (see resolve_pipeline_group_peer
+# below). Without this, get_chat()/send_message() and -- it turns out --
+# even ordinary incoming-message dispatch for this chat fail with
+# "Peer id invalid", because Pyrogram's local session has never learned
+# about this numeric chat ID. Once resolved via username at least once,
+# the numeric ID works fine for everything else (comparisons, etc).
+PIPELINE_GROUP_USERNAME = os.getenv("PIPELINE_GROUP_USERNAME", "novaflix_pipeline")
 TRUSTED_TORRENT_BOT_ID = int(os.getenv("TRUSTED_TORRENT_BOT_ID", "8681574078"))
 
 # Fixed marker line the Torrent Fetcher bot puts at the top of its handoff
@@ -1386,6 +1394,42 @@ async def _do_batch_publish(message: Message, pending: dict, extra_fields: dict 
     await status.edit_text("\n".join(lines))
 
 
+async def main():
+    await app.start()
+
+    # Force Pyrogram to resolve and cache the pipeline group's peer by
+    # looking it up via its public @username at startup. Without this,
+    # every operation involving PIPELINE_GROUP_ID's numeric ID --
+    # including, it turns out, ordinary incoming message dispatch for
+    # that chat, not just outbound calls like send_message/get_chat --
+    # fails with "Peer id invalid", because Pyrogram's local session has
+    # never learned this chat exists. This is a one-time resolution per
+    # session; once done, the numeric PIPELINE_GROUP_ID works fine
+    # everywhere else in the code (comparisons, etc) for the rest of
+    # this run.
+    try:
+        resolved_chat = await app.get_chat(f"@{PIPELINE_GROUP_USERNAME}")
+        logger.info("Resolved pipeline group peer at startup: id=%s title=%r",
+                    resolved_chat.id, resolved_chat.title)
+        if resolved_chat.id != PIPELINE_GROUP_ID:
+            logger.warning(
+                "Resolved pipeline group id (%s) does not match configured "
+                "PIPELINE_GROUP_ID (%s) -- update the env var to match.",
+                resolved_chat.id, PIPELINE_GROUP_ID,
+            )
+    except Exception as e:
+        logger.error(
+            "Failed to resolve pipeline group peer at startup via @%s: %s. "
+            "The group handoff feature will not work until this succeeds -- "
+            "check PIPELINE_GROUP_USERNAME and that the bot is still a "
+            "member of that group.",
+            PIPELINE_GROUP_USERNAME, e,
+        )
+
+    await idle()
+    await app.stop()
+
+
 if __name__ == "__main__":
     import http.server
     import socketserver
@@ -1409,5 +1453,5 @@ if __name__ == "__main__":
             httpd.serve_forever()
 
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    app.run()
+    app.run(main())
 
