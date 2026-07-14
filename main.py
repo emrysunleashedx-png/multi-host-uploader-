@@ -39,28 +39,6 @@ UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
 # the LARGE_FILE_WARNING_GB env var if this default doesn't fit your usage.
 LARGE_FILE_WARNING_BYTES = int(float(os.getenv("LARGE_FILE_WARNING_GB", "1.5")) * 1024 ** 3)
 
-# The shared Telegram group both this bot and the separate Torrent Fetcher
-# bot are members of, and that fetcher bot's numeric Telegram user ID.
-# Messages in this group are only ever acted on if they come from exactly
-# this bot ID -- never from other group members, even the admin typing
-# directly in the group -- so a random group message can't accidentally
-# trigger a fake "publish this link" flow.
-PIPELINE_GROUP_ID = int(os.getenv("PIPELINE_GROUP_ID", "-1004319667086"))
-# The group's public @username, used ONLY to force Pyrogram to resolve
-# and cache this chat's peer at startup (see resolve_pipeline_group_peer
-# below). Without this, get_chat()/send_message() and -- it turns out --
-# even ordinary incoming-message dispatch for this chat fail with
-# "Peer id invalid", because Pyrogram's local session has never learned
-# about this numeric chat ID. Once resolved via username at least once,
-# the numeric ID works fine for everything else (comparisons, etc).
-PIPELINE_GROUP_USERNAME = os.getenv("PIPELINE_GROUP_USERNAME", "novaflix_pipeline")
-TRUSTED_TORRENT_BOT_ID = int(os.getenv("TRUSTED_TORRENT_BOT_ID", "8681574078"))
-
-# Fixed marker line the Torrent Fetcher bot puts at the top of its handoff
-# message so this bot can recognize "this text message is a finished
-# torrent upload" versus any other text in the group.
-DOODSTREAM_LINK_MARKER = "DOODSTREAM_LINK"
-
 # In-memory pending-publish state, keyed by chat_id. Holds the parsed guess
 # plus the finished Doodstream URL while waiting for the admin to /confirm
 # or /edit it. This is intentionally simple (no persistence) -- if the bot
@@ -286,137 +264,6 @@ async def _parse_source_and_infer_episode(message: Message):
             episode_was_inferred = True
 
     return guess_title, guess_episode, source_text, episode_was_inferred
-
-
-def _is_trusted_torrent_handoff(message: Message) -> bool:
-    """True only for messages in the shared pipeline group, sent by
-    exactly the trusted Torrent Fetcher bot ID, containing the expected
-    handoff marker. Every one of these conditions must hold -- this is
-    the only thing standing between "trusted automated handoff" and
-    "anyone in the group could type a fake link and get it published".
-    """
-    if message.chat.id != PIPELINE_GROUP_ID:
-        return False
-    if not message.from_user or message.from_user.id != TRUSTED_TORRENT_BOT_ID:
-        return False
-    text = message.text or ""
-    return text.strip().startswith(DOODSTREAM_LINK_MARKER)
-
-
-@app.on_message(filters.text, group=1)
-async def handle_torrent_handoff(client: Client, message: Message):
-    # IMPORTANT: registered with group=1 (not the default group=0 that
-    # every /confirm, /edit, /pick etc. handler uses). Pyrogram only runs
-    # ONE handler per dispatch group per update when filters overlap --
-    # "only the first [registered handler] is executed and any other
-    # handler will be ignored. This is intended by design" (Pyrogram
-    # docs). Since this handler matches bare filters.text, which overlaps
-    # with every private command handler below, putting it in its own
-    # group is required so it runs ALONGSIDE those handlers rather than
-    # silently replacing them for every private message. See "More on
-    # Updates" in Pyrogram's docs for the handler-groups mechanism.
-    #
-    # Also deliberately NOT using filters.group here, on top of that:
-    # filters.group depends on Telegram correctly reporting
-    # message.chat.type as GROUP/SUPERGROUP -- if that classification
-    # ever misreports (e.g. around a basic-group -> supergroup upgrade,
-    # which making a group public can silently trigger), the handler
-    # would never fire, with no error, no log, nothing to go on. Chat ID
-    # is a much more basic, reliable piece of data than chat type
-    # classification, so gating on it directly (inside
-    # _is_trusted_torrent_handoff) is more defensive than trusting
-    # filters.group's classification.
-    #
-    # TEMPORARY diagnostic logging -- unconditional, runs before the trust
-
-    # check, specifically to answer "is this handler even being invoked,
-    # and if so, why does the trust check reject it?" Remove once the
-    # group handoff is confirmed working reliably.
-    logger.info(
-        "handle_torrent_handoff invoked: chat.id=%r (expected %r), "
-        "from_user.id=%r (expected %r), text_startswith_marker=%r",
-        message.chat.id, PIPELINE_GROUP_ID,
-        message.from_user.id if message.from_user else None, TRUSTED_TORRENT_BOT_ID,
-        (message.text or "").strip().startswith(DOODSTREAM_LINK_MARKER),
-    )
-
-    if not _is_trusted_torrent_handoff(message):
-        return  # not our marker, not our bot, or not our group -- ignore silently
-
-    lines = [l.strip() for l in message.text.strip().splitlines() if l.strip()]
-    # Expected shape:
-    #   DOODSTREAM_LINK
-    #   https://dood.to/d/abc123
-    #   Original.Torrent.Or.File.Name.S01E01.1080p
-    if len(lines) < 2 or not lines[1].startswith("http"):
-        logger.warning("Malformed torrent handoff message, ignoring: %r", message.text)
-        return
-
-    dood_url = lines[1]
-    source_text = lines[2] if len(lines) > 2 else ""
-
-    logger.info("Received torrent handoff: url=%r source_text=%r", dood_url, source_text)
-
-    guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
-    episode_was_inferred = False
-    if guess_title and not guess_episode:
-        try:
-            inferred = await asyncio.to_thread(firestore_publish.infer_next_episode, guess_title)
-        except Exception as e:
-            logger.warning("Episode inference failed for torrent handoff: %s", e)
-            inferred = ""
-        if inferred:
-            guess_episode = inferred
-            episode_was_inferred = True
-
-    guess_quality = firestore_publish.detect_quality(source_text)
-
-    # Torrent handoffs skip download/upload entirely (already done by the
-    # other bot) -- go straight to the same pending-confirm state a normal
-    # upload would reach, in THIS bot's own private chat with the admin,
-    # not the group -- /confirm, /edit etc. are private-chat-only commands,
-    # and pending state is keyed by chat_id, so this intentionally uses
-    # the admin's private chat ID, not the group's, as the key.
-    admin_chat_id = _resolve_admin_chat_id()
-    if admin_chat_id is None:
-        logger.error(
-            "Received a torrent handoff but ADMIN_CHAT_ID isn't configured -- "
-            "can't route this into the confirm flow. Set the ADMIN_CHAT_ID env var."
-        )
-        return
-
-    PENDING_PUBLISHES[admin_chat_id] = {
-        "title": guess_title,
-        "episode": guess_episode,
-        "url": dood_url,
-        "year": None,
-        "category": "series" if guess_episode else "movie",
-        "quality": guess_quality,
-        "episode_was_inferred": episode_was_inferred,
-        "tmdb_candidates": None,
-        "tmdb_type": None,
-    }
-
-    title_line = guess_title or "(couldn't guess a title)"
-    if guess_episode and episode_was_inferred:
-        episode_line = f"{guess_episode} (inferred — not in filename, double check this!)"
-    else:
-        episode_line = guess_episode or "(none detected)"
-    category_line = PENDING_PUBLISHES[admin_chat_id]["category"]
-    quality_line = guess_quality or "(not detected)"
-
-    await client.send_message(
-        admin_chat_id,
-        "📦 **Torrent upload received!**\n\n"
-        f"🍿 **Doodstream:** {dood_url}\n\n"
-        "**Ready to publish to the site.** Best guess from the torrent name:\n"
-        f"• Title: `{title_line}`\n"
-        f"• Episode: {episode_line}\n"
-        f"• Category: `{category_line}`\n"
-        f"• Quality: `{quality_line}`\n\n"
-        "Reply `/confirm` to look this up on TMDB and publish, or "
-        "`/edit <title> | <episode> | <year> | <category> | <quality>` to correct it first."
-    )
 
 
 def _resolve_admin_chat_id():
@@ -896,44 +743,6 @@ async def handle_toggle_flag(client: Client, message: Message):
     await message.reply_text(f"{emoji} `{result['title']}` — {command_word} is now **{state_word}**.")
 
 
-@app.on_message(filters.private & filters.command("checkgroup"))
-async def handle_check_group(client: Client, message: Message):
-    """ONE-TIME DIAGNOSTIC command. Bypasses Telegram's update-push
-    system entirely (the layer every previous debugging attempt has
-    depended on) by directly asking Telegram "what messages exist in the
-    pipeline group right now", via get_chat_history(). If this finds the
-    DOODSTREAM_LINK messages that on_message handlers have never fired
-    for, it proves the problem is specifically in update delivery/dispatch
-    for this chat, not in permissions, chat resolution, or anything more
-    fundamental. Safe to leave in permanently (does nothing unless you
-    explicitly run /checkgroup) or remove once the real issue is found.
-    """
-    status = await message.reply_text(f"🔍 Fetching recent history for chat_id={PIPELINE_GROUP_ID} directly...")
-
-    try:
-        chat = await client.get_chat(PIPELINE_GROUP_ID)
-        chat_info = f"type={chat.type}, title={chat.title!r}, id={chat.id}"
-    except Exception as e:
-        await status.edit_text(f"❌ get_chat() failed: {type(e).__name__}: {e}")
-        return
-
-    lines = [f"✅ get_chat() succeeded: {chat_info}", ""]
-
-    try:
-        count = 0
-        async for msg in client.get_chat_history(PIPELINE_GROUP_ID, limit=10):
-            count += 1
-            sender = msg.from_user.id if msg.from_user else "(no from_user)"
-            preview = (msg.text or msg.caption or "(no text)")[:60].replace("\n", " ")
-            lines.append(f"{count}. from={sender} text={preview!r}")
-        if count == 0:
-            lines.append("(get_chat_history returned zero messages)")
-    except Exception as e:
-        lines.append(f"❌ get_chat_history() failed: {type(e).__name__}: {e}")
-
-    await status.edit_text("\n".join(lines))
-
-
 @app.on_message(filters.private & filters.command("help"))
 async def handle_help(client: Client, message: Message):
     await message.reply_text(
@@ -1394,37 +1203,131 @@ async def _do_batch_publish(message: Message, pending: dict, extra_fields: dict 
     await status.edit_text("\n".join(lines))
 
 
+POLL_INTERVAL_SECONDS = int(os.getenv("TORRENT_POLL_INTERVAL_SECONDS", "30"))
+
+
+async def poll_pending_torrent_uploads(client: Client):
+    """Background loop: periodically checks Firestore for finished
+    torrent uploads Torrent Fetcher has queued, and feeds each one
+    through the same parse -> dup-check -> confirm-prompt flow a normal
+    Telegram file upload goes through -- just triggered by a Firestore
+    doc appearing instead of a Telegram message arriving.
+
+    Runs for the lifetime of the process (started once in main(), never
+    awaited/joined). Any single iteration's exceptions are caught and
+    logged so one bad poll doesn't kill the whole loop.
+    """
+    logger.info("Torrent upload polling started (interval=%ds)", POLL_INTERVAL_SECONDS)
+    while True:
+        try:
+            pending = await asyncio.to_thread(firestore_publish.fetch_unprocessed_torrent_uploads)
+        except Exception as e:
+            logger.warning("Polling for pending torrent uploads failed (will retry): %s", e)
+            pending = []
+
+        for item in pending:
+            try:
+                await _handle_polled_torrent_upload(client, item)
+            except Exception:
+                logger.exception("Failed to process pending torrent upload doc %s", item.get("doc_id"))
+                # Don't mark as processed on failure -- leave it for the
+                # next poll to retry, rather than silently losing it.
+                continue
+
+            try:
+                await asyncio.to_thread(firestore_publish.mark_torrent_upload_processed, item["doc_id"])
+            except Exception:
+                logger.exception("Failed to mark doc %s as processed (will likely reprocess next poll)",
+                                  item.get("doc_id"))
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+async def _handle_polled_torrent_upload(client: Client, item: dict):
+    """Turn one pending_torrent_uploads doc into the same "ready to
+    /confirm" state and message a normal Telegram upload would produce --
+    see _download_and_upload for the message this mirrors.
+    """
+    dood_url = item.get("doodstreamUrl", "")
+    source_text = item.get("originalFilename", "") or ""
+    target_chat_id = item.get("requestedByChatId") or _resolve_admin_chat_id()
+
+    if not dood_url.startswith("http"):
+        logger.warning("Skipping malformed pending torrent upload doc %s: url=%r",
+                        item.get("doc_id"), dood_url)
+        return
+
+    if target_chat_id is None:
+        logger.error(
+            "Pending torrent upload doc %s has no requestedByChatId and "
+            "ADMIN_CHAT_ID isn't configured -- can't route this anywhere.",
+            item.get("doc_id"),
+        )
+        return
+
+    guess_title, guess_episode = firestore_publish.parse_title_and_episode(source_text)
+    episode_was_inferred = False
+    if guess_title and not guess_episode:
+        try:
+            inferred = await asyncio.to_thread(firestore_publish.infer_next_episode, guess_title)
+        except Exception as e:
+            logger.warning("Episode inference failed for polled upload: %s", e)
+            inferred = ""
+        if inferred:
+            guess_episode = inferred
+            episode_was_inferred = True
+
+    guess_quality = firestore_publish.detect_quality(source_text)
+
+    PENDING_PUBLISHES[target_chat_id] = {
+        "title": guess_title,
+        "episode": guess_episode,
+        "url": dood_url,
+        "year": None,
+        "category": "series" if guess_episode else "movie",
+        "quality": guess_quality,
+        "episode_was_inferred": episode_was_inferred,
+        "tmdb_candidates": None,
+        "tmdb_type": None,
+    }
+
+    title_line = guess_title or "(couldn't guess a title)"
+    if guess_episode and episode_was_inferred:
+        episode_line = f"{guess_episode} (inferred — not in filename, double check this!)"
+    else:
+        episode_line = guess_episode or "(none detected)"
+    category_line = PENDING_PUBLISHES[target_chat_id]["category"]
+    quality_line = guess_quality or "(not detected)"
+
+    await client.send_message(
+        target_chat_id,
+        "📦 **Torrent upload received!**\n\n"
+        f"🍿 **Doodstream:** {dood_url}\n\n"
+        "**Ready to publish to the site.** Best guess from the torrent name:\n"
+        f"• Title: `{title_line}`\n"
+        f"• Episode: {episode_line}\n"
+        f"• Category: `{category_line}`\n"
+        f"• Quality: `{quality_line}`\n\n"
+        "Reply `/confirm` to look this up on TMDB and publish, or "
+        "`/edit <title> | <episode> | <year> | <category> | <quality>` to correct it first.",
+    )
+    logger.info("Delivered polled torrent upload (doc=%s) to chat_id=%s",
+                item.get("doc_id"), target_chat_id)
+
+
 async def main():
     await app.start()
 
-    # Force Pyrogram to resolve and cache the pipeline group's peer by
-    # looking it up via its public @username at startup. Without this,
-    # every operation involving PIPELINE_GROUP_ID's numeric ID --
-    # including, it turns out, ordinary incoming message dispatch for
-    # that chat, not just outbound calls like send_message/get_chat --
-    # fails with "Peer id invalid", because Pyrogram's local session has
-    # never learned this chat exists. This is a one-time resolution per
-    # session; once done, the numeric PIPELINE_GROUP_ID works fine
-    # everywhere else in the code (comparisons, etc) for the rest of
-    # this run.
-    try:
-        resolved_chat = await app.get_chat(f"@{PIPELINE_GROUP_USERNAME}")
-        logger.info("Resolved pipeline group peer at startup: id=%s title=%r",
-                    resolved_chat.id, resolved_chat.title)
-        if resolved_chat.id != PIPELINE_GROUP_ID:
-            logger.warning(
-                "Resolved pipeline group id (%s) does not match configured "
-                "PIPELINE_GROUP_ID (%s) -- update the env var to match.",
-                resolved_chat.id, PIPELINE_GROUP_ID,
-            )
-    except Exception as e:
-        logger.error(
-            "Failed to resolve pipeline group peer at startup via @%s: %s. "
-            "The group handoff feature will not work until this succeeds -- "
-            "check PIPELINE_GROUP_USERNAME and that the bot is still a "
-            "member of that group.",
-            PIPELINE_GROUP_USERNAME, e,
-        )
+    # Launch the background task that polls Firestore for finished torrent
+    # uploads (see poll_pending_torrent_uploads below). This replaces the
+    # original Telegram-group-message handoff design, which never reliably
+    # worked in production for reasons that stayed unresolved despite
+    # checking every individually-verifiable cause (group membership,
+    # Privacy Mode, peer resolution, dispatch priority all came back fine,
+    # yet the group message still silently never reached an on_message
+    # handler). Polling a data store both bots already talk to reliably
+    # sidesteps that whole layer.
+    asyncio.create_task(poll_pending_torrent_uploads(app))
 
     await idle()
     await app.stop()
@@ -1454,4 +1357,3 @@ if __name__ == "__main__":
 
     threading.Thread(target=run_dummy_server, daemon=True).start()
     app.run(main())
-
