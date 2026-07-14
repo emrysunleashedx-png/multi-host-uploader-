@@ -579,3 +579,57 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     _, doc_ref = db.collection(ROOT_COLLECTION).add(payload)
     logger.info("Created new doc %s for title=%r (slug=%s)", doc_ref.id, title, slug)
     return {"action": "created", "doc_id": doc_ref.id, "slug": slug}
+
+
+PENDING_TORRENT_COLLECTION = "pending_torrent_uploads"
+
+
+def fetch_unprocessed_torrent_uploads(limit: int = 10) -> list:
+    """Poll for finished torrent uploads the Torrent Fetcher bot has
+    queued (see that bot's firestore_handoff.py). This replaces the
+    original design where Torrent Fetcher posted a message to a shared
+    Telegram group for Media Router to react to -- that approach turned
+    out to be unreliable for reasons never fully pinned down (every
+    individually-checkable cause -- group membership, Privacy Mode,
+    peer resolution, dispatch priority -- came back fine, and the
+    message still silently never reached an on_message handler).
+    Firestore polling sidesteps the whole Telegram-to-Telegram messaging
+    problem by using a data store both bots already reliably talk to.
+
+    Returns a list of dicts: [{"doc_id", "doodstreamUrl", "originalFilename",
+    "requestedByChatId"}, ...], oldest first. Does NOT mark them
+    processed -- call mark_torrent_upload_processed() after successfully
+    handling each one, so a crash between fetch and processing doesn't
+    silently lose the upload (it'll just be picked up again next poll).
+    """
+    db = _db or init_firebase()
+
+    query = (
+        db.collection(PENDING_TORRENT_COLLECTION)
+        .where("processed", "==", False)
+        .limit(limit)
+    )
+    results = []
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        results.append({
+            "doc_id": doc.id,
+            "doodstreamUrl": data.get("doodstreamUrl", ""),
+            "originalFilename": data.get("originalFilename", ""),
+            "requestedByChatId": data.get("requestedByChatId"),
+        })
+    return results
+
+
+def mark_torrent_upload_processed(doc_id: str):
+    """Mark a pending_torrent_uploads doc as handled so it isn't picked
+    up again on the next poll. Doesn't delete it -- keeping a processed
+    record around is cheap and useful for debugging what's come through,
+    unlike leaving it in the "unprocessed" state which would cause
+    reprocessing loops.
+    """
+    db = _db or init_firebase()
+    db.collection(PENDING_TORRENT_COLLECTION).document(doc_id).update({
+        "processed": True,
+        "processedAt": _firestore.SERVER_TIMESTAMP,
+    })
