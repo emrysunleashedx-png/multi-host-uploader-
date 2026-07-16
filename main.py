@@ -28,6 +28,13 @@ HOSTERS = {
     },
 }
 
+# Streamtape uses a different auth scheme (login+key pair, not a single
+# API key) and a different upload protocol than the Doodstream-style
+# hosters above, so it's handled by its own dedicated function
+# (upload_to_streamtape) rather than folded into HOSTERS/upload_to_hoster.
+STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN", "")
+STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY", "")
+
 # Upload network timeout. None (no timeout) risks the bot hanging forever
 # on a stalled connection; use generous but finite limits instead.
 UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
@@ -55,6 +62,12 @@ PENDING_PUBLISHES = {}
 # /forceupload is used or a new file comes in (only the most recent
 # duplicate warning can be force-uploaded).
 PENDING_FORCE_UPLOAD = {}
+
+# Holds a file (message + already-parsed title/episode/etc) that's
+# downloaded-and-ready but waiting on the admin to pick which hoster to
+# upload it to, keyed by chat_id. Populated by handle_media right before
+# prompting for /host, consumed by handle_host_choice.
+PENDING_HOST_CHOICE = {}
 
 # Remembers the most recently published title per chat, so /feature,
 # /trending, /new, /recommend can default to "whatever I just published"
@@ -241,6 +254,95 @@ async def _attempt_upload(client: httpx.AsyncClient, hoster_name: str, config: d
     return f"Upload Failed: no filecode in response ({upload_data})"
 
 
+async def upload_to_streamtape(client: httpx.AsyncClient, file_path: str) -> str:
+    """Upload a file to Streamtape.
+
+    Streamtape's API (streamtape.com/api) differs from the Doodstream-style
+    hosters above in several ways:
+      - Auth is a login+key pair (not a single API key).
+      - GET https://api.streamtape.com/file/ul?login=..&key=.. returns
+        {"status":200,"msg":"OK","result":{"url":"https://<server>/xfsupload/<id>",
+        "valid_until":"..."}} -- "result" is a dict with the upload URL
+        inside it, not a bare string like Doodstream.
+      - The multipart form field for the file is "file1", not "file".
+      - The POST-upload response is {"status":200,"msg":"OK",
+        "result":{"name":..., "size":..., "url":"https://tapecontent.net/<id-or-name>.mp4"}}.
+        NOTE: Streamtape's own docs example for this response uses the
+        original filename in the URL, not a stable file id, and there is no
+        separate "id"/"linkid"/"filecode" field in this particular response.
+        Rather than guess at constructing a streamtape.com/v/<id> share link
+        (which could easily be wrong and produce a dead link), we return the
+        content URL Streamtape actually gave us -- it's guaranteed correct,
+        even if it isn't the prettiest possible link.
+    """
+    if not STREAMTAPE_LOGIN or not STREAMTAPE_KEY:
+        return "Key Missing ⚠️"
+
+    filename = os.path.basename(file_path)
+
+    try:
+        server_resp = await client.get(
+            "https://api.streamtape.com/file/ul",
+            params={"login": STREAMTAPE_LOGIN, "key": STREAMTAPE_KEY},
+            headers=HEADERS,
+            timeout=UPLOAD_TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        logger.warning("Streamtape: timed out fetching upload server")
+        return "Error: request to fetch upload server timed out"
+    except httpx.HTTPError as e:
+        logger.warning("Streamtape: network error fetching upload server: %s", e)
+        return f"Error: network issue contacting Streamtape ({type(e).__name__})"
+
+    try:
+        server_data = server_resp.json()
+    except ValueError:
+        logger.warning("Streamtape: non-JSON server response (HTTP %s): %r",
+                        server_resp.status_code, server_resp.text[:200])
+        return f"API Error (HTTP {server_resp.status_code})"
+
+    result = server_data.get("result")
+    upload_url = result.get("url") if isinstance(result, dict) else None
+    if not upload_url:
+        return f"Server Error: {server_data.get('msg', 'No Upload URL')}"
+
+    try:
+        async def _post():
+            with open(file_path, "rb") as f:
+                files = {"file1": (filename, f, "application/octet-stream")}
+                return await client.post(
+                    upload_url,
+                    files=files,
+                    headers=HEADERS,
+                    timeout=UPLOAD_TIMEOUT,
+                )
+
+        upload_resp = await _post()
+    except httpx.TimeoutException:
+        logger.warning("Streamtape: upload timed out for %s", filename)
+        return "Error: upload timed out"
+    except httpx.HTTPError as e:
+        logger.warning("Streamtape: network error during upload: %s", e)
+        return f"Error: network issue during upload ({type(e).__name__})"
+    except OSError as e:
+        logger.error("Streamtape: could not read local file %s: %s", file_path, e)
+        return "Error: could not read downloaded file"
+
+    try:
+        upload_data = upload_resp.json()
+    except ValueError:
+        logger.warning("Streamtape: invalid upload response: %r", upload_resp.text[:200])
+        return f"Response Parse Error: {upload_resp.text[:100]}"
+
+    result = upload_data.get("result")
+    content_url = result.get("url") if isinstance(result, dict) else None
+    if content_url:
+        return content_url
+
+    logger.warning("Streamtape: upload failed, response=%r", upload_data)
+    return f"Upload Failed: no content URL in response ({upload_data})"
+
+
 async def _parse_source_and_infer_episode(message: Message):
     """Shared by handle_media and handle_force_upload: parse title/episode
     from caption/filename, then fill in a missing episode via inference
@@ -333,10 +435,52 @@ async def handle_media(client: Client, message: Message):
         return
 
     if message.chat.id in BATCH_SESSIONS and BATCH_SESSIONS[message.chat.id]["active"]:
+        # Batch mode intentionally always uses Doodstream, not a per-file
+        # prompt -- asking "which host?" for every single episode in a
+        # season pack would defeat the point of batch mode's "no per-file
+        # interaction" design. Pick a host once via /edit or a future
+        # /batch host command if this needs to be configurable later.
         await _download_and_collect_for_batch(message, guess_title, guess_episode, source_text)
         return
 
-    await _download_and_upload(client, message, guess_title, guess_episode, source_text, episode_was_inferred)
+    PENDING_HOST_CHOICE[message.chat.id] = {
+        "message": message,
+        "guess_title": guess_title,
+        "guess_episode": guess_episode,
+        "source_text": source_text,
+        "episode_was_inferred": episode_was_inferred,
+    }
+    await message.reply_text(
+        "📡 Where should this upload to?\n\n"
+        "Reply `/host doodstream` or `/host streamtape`."
+    )
+
+
+@app.on_message(filters.private & filters.command("host"))
+async def handle_host_choice(client: Client, message: Message):
+    pending = PENDING_HOST_CHOICE.pop(message.chat.id, None)
+    if not pending:
+        await message.reply_text(
+            "Nothing waiting on a host choice. Send a file first, then reply "
+            "`/host doodstream` or `/host streamtape` when asked."
+        )
+        return
+
+    raw = message.text.split(None, 1)
+    choice = raw[1].strip().lower() if len(raw) > 1 else ""
+    host_map = {"doodstream": "Doodstream", "streamtape": "Streamtape"}
+    host = host_map.get(choice)
+
+    if not host:
+        await message.reply_text("Usage: `/host doodstream` or `/host streamtape`.")
+        # Put it back so the admin doesn't have to re-send the file after a typo.
+        PENDING_HOST_CHOICE[message.chat.id] = pending
+        return
+
+    await _download_and_upload(
+        client, pending["message"], pending["guess_title"], pending["guess_episode"],
+        pending["source_text"], pending["episode_was_inferred"], host,
+    )
 
 
 @app.on_message(filters.private & filters.command("forceupload"))
@@ -352,15 +496,29 @@ async def handle_force_upload(client: Client, message: Message):
     guess_title, guess_episode, source_text, episode_was_inferred = \
         await _parse_source_and_infer_episode(original_message)
 
-    await message.reply_text("Proceeding with download/upload despite the warning...")
-    await _download_and_upload(client, original_message, guess_title, guess_episode, source_text, episode_was_inferred)
+    # /forceupload skips duplicate/size warnings but still asks which host
+    # to use, same as the normal flow -- it's overriding the warning, not
+    # the host choice.
+    PENDING_HOST_CHOICE[message.chat.id] = {
+        "message": original_message,
+        "guess_title": guess_title,
+        "guess_episode": guess_episode,
+        "source_text": source_text,
+        "episode_was_inferred": episode_was_inferred,
+    }
+    await message.reply_text(
+        "Proceeding despite the warning. Where should this upload to?\n\n"
+        "Reply `/host doodstream` or `/host streamtape`."
+    )
 
 
-async def _download_and_upload_core(message: Message, status_msg: Message):
+async def _download_and_upload_core(message: Message, status_msg: Message, host: str = "Doodstream"):
     """Shared by both the single-file flow and batch mode: download from
-    Telegram, upload to Doodstream, clean up the local file. Returns
-    (dood_url_or_error_string, succeeded: bool). The caller decides what
-    to do next (prompt for confirm, or silently append to a batch).
+    Telegram, upload to the chosen hoster, clean up the local file.
+    Returns (url_or_error_string, succeeded: bool). The caller decides
+    what to do next (prompt for confirm, or silently append to a batch).
+
+    host must be "Doodstream" or "Streamtape".
     """
     try:
         # Pyrogram's download() is already async-native (runs its own I/O off
@@ -374,14 +532,17 @@ async def _download_and_upload_core(message: Message, status_msg: Message):
         return "Download failed.", False
 
     try:
-        await status_msg.edit_text("🚀 Uploading to Doodstream...")
+        await status_msg.edit_text(f"🚀 Uploading to {host}...")
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
-            dood_url = await upload_to_hoster(http_client, "Doodstream", file_path)
+            if host == "Streamtape":
+                result_url = await upload_to_streamtape(http_client, file_path)
+            else:
+                result_url = await upload_to_hoster(http_client, "Doodstream", file_path)
 
-        if not dood_url.startswith("http"):
-            return _format_upload_failure(dood_url), False
+        if not result_url.startswith("http"):
+            return _format_upload_failure(result_url), False
 
-        return dood_url, True
+        return result_url, True
 
     except Exception as e:
         logger.exception("Unexpected error while processing %s", file_path)
@@ -397,12 +558,12 @@ async def _download_and_upload_core(message: Message, status_msg: Message):
 
 async def _download_and_upload(client: Client, message: Message, guess_title: str,
                                 guess_episode: str, source_text: str,
-                                episode_was_inferred: bool = False):
+                                episode_was_inferred: bool = False, host: str = "Doodstream"):
     status_msg = await message.reply_text("📥 Downloading file from Telegram...")
 
-    dood_url, succeeded = await _download_and_upload_core(message, status_msg)
+    result_url, succeeded = await _download_and_upload_core(message, status_msg, host)
     if not succeeded:
-        await status_msg.edit_text(f"❌ {dood_url}")
+        await status_msg.edit_text(f"❌ {result_url}")
         return
 
     logger.info("Parsing title/episode from source_text=%r (caption=%r, filename=%r)",
@@ -412,7 +573,8 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
     PENDING_PUBLISHES[message.chat.id] = {
         "title": guess_title,
         "episode": guess_episode,
-        "url": dood_url,
+        "url": result_url,
+        "server": host,
         "year": None,
         "category": "series" if guess_episode else "movie",
         "quality": guess_quality,
@@ -430,7 +592,7 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
     quality_line = guess_quality or "(not detected)"
     response = (
         "✅ **Upload complete!**\n\n"
-        f"🍿 **Doodstream:** {dood_url}\n\n"
+        f"🍿 **{host}:** {result_url}\n\n"
         "**Ready to publish to the site.** Best guess from the caption:\n"
         f"• Title: `{title_line}`\n"
         f"• Episode: {episode_line}\n"
@@ -747,7 +909,9 @@ async def handle_toggle_flag(client: Client, message: Message):
 async def handle_help(client: Client, message: Message):
     await message.reply_text(
         "**NovaFlix Media Router — commands**\n\n"
-        "Send a video or document to start an upload. After it finishes:\n"
+        "Send a video or document to start an upload. It'll ask:\n"
+        "• `/host doodstream` or `/host streamtape` — which hoster to upload to\n\n"
+        "Then after it finishes uploading:\n"
         "• `/confirm` — look the guessed title up on TMDB and publish\n"
         "• `/edit <title> | <episode> | <year> | <category> | <quality>` — correct the guess first "
         "(only title is required, e.g. `/edit Parasite | | 2019 | movie`)\n"
@@ -966,7 +1130,7 @@ async def _do_publish(message: Message, pending: dict, extra_fields: dict = None
             pending["title"],
             pending["episode"],
             pending["url"],
-            "Doodstream",
+            pending.get("server", "Doodstream"),
             pending.get("category", "series"),
             extra_fields,
             pending.get("quality", ""),
