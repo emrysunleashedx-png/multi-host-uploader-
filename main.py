@@ -540,7 +540,7 @@ async def _download_and_upload_core(message: Message, status_msg: Message, host:
                 result_url = await upload_to_hoster(http_client, "Doodstream", file_path)
 
         if not result_url.startswith("http"):
-            return _format_upload_failure(result_url), False
+            return _format_upload_failure(result_url, host), False
 
         return result_url, True
 
@@ -754,11 +754,16 @@ async def handle_batch(client: Client, message: Message):
     )
 
 
-def _format_upload_failure(error_text: str) -> str:
+def _format_upload_failure(error_text: str, host: str = "Doodstream") -> str:
     """Give the admin a plain-language read on WHY an upload failed,
-    distinguishing 'Doodstream itself is having problems' (nothing you can
+    distinguishing '<host> itself is having problems' (nothing you can
     do but wait/retry later) from other failure categories, rather than
     always showing the same generic wall of text.
+
+    host names whichever hoster actually produced this error, so the
+    message doesn't misattribute a Streamtape failure to Doodstream (or
+    vice versa) -- see the bug this fixed: a missing STREAMTAPE_KEY was
+    being reported as "Doodstream API key isn't configured".
     """
     lower = error_text.lower()
     # Only classify as an outage/slowdown if it's specifically one of the
@@ -771,13 +776,13 @@ def _format_upload_failure(error_text: str) -> str:
     is_retry_exhaustion = "upload failed after" in lower and "attempts" in lower
     if is_retry_exhaustion:
         return (
-            f"❌ **Upload failed — looks like a Doodstream outage or slowdown**, not a problem with your file.\n\n"
+            f"❌ **Upload failed — looks like a {host} outage or slowdown**, not a problem with your file.\n\n"
             f"Details: {error_text}\n\n"
             "This was retried automatically and still failed. Worth trying again "
-            "in a few minutes, or checking Doodstream's status if it keeps happening."
+            "in a few minutes, or checking the hoster's status if it keeps happening."
         )
     if "key missing" in lower:
-        return f"❌ **Doodstream API key isn't configured** on the bot. Details: {error_text}"
+        return f"❌ **{host} API key isn't configured** on the bot. Details: {error_text}"
     return f"❌ Upload failed: {error_text}"
 
 
