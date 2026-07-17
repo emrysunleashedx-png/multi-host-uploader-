@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import asyncio
 import httpx
@@ -86,6 +87,16 @@ BATCH_SESSIONS = {}
 # batch equivalent of PENDING_PUBLISHES, but with an "episodes" list
 # instead of a single episode/url/quality set.
 BATCH_PENDING_PUBLISH = {}
+
+# Holds one just-uploaded batch entry that's waiting on the admin to
+# confirm/correct its episode number via /setepisode, keyed by chat_id.
+# Populated right after each batch-mode upload finishes; consumed by
+# handle_set_episode, which appends the finalized entry to the batch
+# session's "episodes" list. While this is set, new files can still come
+# in (they'll queue behind it in Telegram's own message ordering -- the
+# admin is expected to answer /setepisode before forwarding the next
+# file, since there's only one pending slot per chat).
+PENDING_BATCH_EPISODE = {}
 
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -385,6 +396,16 @@ def _resolve_admin_chat_id():
         return None
 
 
+def _get_file_size(message: Message) -> int:
+    """Telegram-reported file size in bytes for a video/document message,
+    or 0 if unavailable. Shared by the large-file warning check and the
+    file-size fallback used when publishing (see firestore_publish.
+    publish_doodstream_link's file_size_bytes param).
+    """
+    return getattr(message.document, "file_size", None) or \
+           getattr(message.video, "file_size", None) or 0
+
+
 @app.on_message(filters.private & (filters.video | filters.document))
 async def handle_media(client: Client, message: Message):
     # Parse title/episode from caption/filename BEFORE downloading anything,
@@ -421,8 +442,7 @@ async def handle_media(client: Client, message: Message):
             PENDING_FORCE_UPLOAD[message.chat.id] = message
             return
 
-    file_size = getattr(message.document, "file_size", None) or \
-                getattr(message.video, "file_size", None) or 0
+    file_size = _get_file_size(message)
     if file_size >= LARGE_FILE_WARNING_BYTES:
         size_gb = file_size / (1024 ** 3)
         await message.reply_text(
@@ -512,13 +532,53 @@ async def handle_force_upload(client: Client, message: Message):
     )
 
 
-async def _download_and_upload_core(message: Message, status_msg: Message, host: str = "Doodstream"):
+def _sanitize_filename_part(text: str) -> str:
+    """Strip characters that are unsafe/awkward in filenames (path
+    separators, quotes, control chars) and collapse whitespace, without
+    being as aggressive as slugify() -- we want "The Scarecrow S01E02",
+    not "the-scarecrow-s01e02", since this is a display filename the
+    hoster shows to viewers, not a URL slug.
+    """
+    if not text:
+        return ""
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .-")
+    return cleaned
+
+
+def _build_upload_filename(original_path: str, guess_title: str, guess_episode: str) -> str:
+    """Build a clean "<Title> <Episode><ext>" (or just "<Title><ext>" for
+    a movie with no episode) filename to upload as, instead of whatever
+    noisy name/watermark the source channel used. Falls back to the
+    original filename untouched if no title could be guessed at all --
+    a wrong guess is worse than no rename, but no guess means there's
+    nothing safe to rename to.
+    """
+    ext = os.path.splitext(original_path)[1]
+    title_part = _sanitize_filename_part(guess_title or "")
+    if not title_part:
+        return os.path.basename(original_path)
+
+    episode_part = _sanitize_filename_part(guess_episode or "")
+    base = f"{title_part} {episode_part}".strip() if episode_part else title_part
+    return f"{base}{ext}"
+
+
+async def _download_and_upload_core(message: Message, status_msg: Message, host: str = "Doodstream",
+                                     guess_title: str = None, guess_episode: str = None):
     """Shared by both the single-file flow and batch mode: download from
     Telegram, upload to the chosen hoster, clean up the local file.
     Returns (url_or_error_string, succeeded: bool). The caller decides
     what to do next (prompt for confirm, or silently append to a batch).
 
     host must be "Doodstream" or "Streamtape".
+
+    If guess_title is given, the downloaded file is renamed to
+    "<Title> <Episode>.<ext>" (source channel watermarks/junk stripped)
+    before it's handed to the uploader, so that's the name the hoster
+    -- and anyone downloading from it -- sees, rather than the original
+    source filename. Renaming happens on the local temp copy only; if no
+    title was guessed, the original filename is kept as-is.
     """
     try:
         # Pyrogram's download() is already async-native (runs its own I/O off
@@ -530,6 +590,24 @@ async def _download_and_upload_core(message: Message, status_msg: Message, host:
 
     if not file_path or not os.path.exists(file_path):
         return "Download failed.", False
+
+    if guess_title:
+        new_filename = _build_upload_filename(file_path, guess_title, guess_episode)
+        new_path = os.path.join(os.path.dirname(file_path), new_filename)
+        try:
+            if new_path != file_path:
+                # If a file with the target name already exists (e.g. two
+                # episodes downloaded to the same temp dir before either
+                # was renamed), fall back to the original name rather than
+                # silently overwriting/colliding.
+                if not os.path.exists(new_path):
+                    os.rename(file_path, new_path)
+                    file_path = new_path
+                else:
+                    logger.warning("Rename target %s already exists, keeping original filename", new_path)
+        except OSError as e:
+            logger.warning("Could not rename %s to %s, uploading with original name: %s",
+                            file_path, new_path, e)
 
     try:
         await status_msg.edit_text(f"🚀 Uploading to {host}...")
@@ -561,7 +639,9 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
                                 episode_was_inferred: bool = False, host: str = "Doodstream"):
     status_msg = await message.reply_text("📥 Downloading file from Telegram...")
 
-    result_url, succeeded = await _download_and_upload_core(message, status_msg, host)
+    result_url, succeeded = await _download_and_upload_core(
+        message, status_msg, host, guess_title=guess_title, guess_episode=guess_episode
+    )
     if not succeeded:
         await status_msg.edit_text(f"❌ {result_url}")
         return
@@ -569,6 +649,7 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
     logger.info("Parsing title/episode from source_text=%r (caption=%r, filename=%r)",
                 source_text, message.caption, getattr(message.document, "file_name", None))
     guess_quality = firestore_publish.detect_quality(source_text)
+    file_size_bytes = _get_file_size(message)
 
     PENDING_PUBLISHES[message.chat.id] = {
         "title": guess_title,
@@ -581,6 +662,7 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
         "episode_was_inferred": episode_was_inferred,
         "tmdb_candidates": None,  # populated once /confirm triggers a TMDB search
         "tmdb_type": None,
+        "file_size_bytes": file_size_bytes,
     }
 
     title_line = guess_title or "(couldn't guess a title)"
@@ -611,15 +693,21 @@ async def _download_and_collect_for_batch(message: Message, guess_title: str,
                                            guess_episode: str, source_text: str):
     """Batch-mode equivalent of _download_and_upload: downloads and
     uploads the file exactly the same way, but instead of prompting for
-    confirm/edit, silently records the result into the active batch
-    session and shows a one-line progress update. The actual Firestore
-    publish for everything collected happens once, in bulk, when the
-    admin runs /batch done.
+    confirm/edit, stops after the upload to ask the admin to confirm the
+    episode number for this file (via /setepisode) before it's added to
+    the batch. This always asks, even when an episode was successfully
+    parsed or inferred, since caption/filename guesses (and especially
+    inferred "next episode" guesses) are exactly the kind of thing worth
+    a human glance before it's baked into a batch of possibly a dozen
+    files. The actual Firestore publish for everything collected happens
+    once, in bulk, when the admin runs /batch done.
     """
     session = BATCH_SESSIONS[message.chat.id]
     status_msg = await message.reply_text("📥 Downloading (batch)...")
 
-    dood_url, succeeded = await _download_and_upload_core(message, status_msg)
+    dood_url, succeeded = await _download_and_upload_core(
+        message, status_msg, guess_title=guess_title, guess_episode=guess_episode
+    )
     if not succeeded:
         await status_msg.edit_text(
             f"❌ {dood_url}\n\n(This file was skipped -- the rest of the batch is unaffected.)"
@@ -634,18 +722,65 @@ async def _download_and_collect_for_batch(message: Message, guess_title: str,
     if not session.get("title_guess") and guess_title:
         session["title_guess"] = guess_title
 
-    entry = {
-        "episode": guess_episode or "",
+    PENDING_BATCH_EPISODE[message.chat.id] = {
         "quality": guess_quality,
         "url": dood_url,
         "source_text": source_text,
+        "guess_episode": guess_episode or "",
+        "file_size_bytes": _get_file_size(message),
+    }
+
+    guess_note = f" — best guess: `{guess_episode}`" if guess_episode else " (nothing detected)"
+    await status_msg.edit_text(
+        f"✅ Uploaded{f' [{guess_quality}]' if guess_quality else ''}. What episode is this{guess_note}?\n\n"
+        + (f"Reply `/setepisode {guess_episode}` to accept the guess, or `/setepisode <value>` "
+           if guess_episode else "Reply `/setepisode <value>` ")
+        + "to set it (e.g. `/setepisode S01E03`)."
+    )
+
+
+@app.on_message(filters.private & filters.command("setepisode"))
+async def handle_set_episode(client: Client, message: Message):
+    pending = PENDING_BATCH_EPISODE.pop(message.chat.id, None)
+    if not pending:
+        await message.reply_text(
+            "Nothing waiting on an episode number. This only applies right after "
+            "a batch-mode upload finishes."
+        )
+        return
+
+    raw = message.text.split(None, 1)
+    episode = raw[1].strip() if len(raw) > 1 else ""
+    if not episode:
+        await message.reply_text("Usage: `/setepisode <value>` -- e.g. `/setepisode S01E03`.")
+        # Put it back so the admin doesn't lose the pending entry over a
+        # bare `/setepisode` with no argument.
+        PENDING_BATCH_EPISODE[message.chat.id] = pending
+        return
+
+    session = BATCH_SESSIONS.get(message.chat.id)
+    if not session or not session["active"]:
+        # The batch was cancelled/finished while this upload's episode
+        # prompt was still outstanding -- nothing sensible to append to.
+        await message.reply_text(
+            "⚠️ No active batch to add this episode to (it may have been finished or "
+            "cancelled while this was pending). This upload's link wasn't lost -- "
+            "it's on the hoster -- but it won't appear in the batch."
+        )
+        return
+
+    entry = {
+        "episode": episode,
+        "quality": pending["quality"],
+        "url": pending["url"],
+        "source_text": pending["source_text"],
+        "file_size_bytes": pending.get("file_size_bytes", 0),
     }
     session["episodes"].append(entry)
 
-    episode_note = guess_episode or "(no episode detected -- check this in /batch status)"
-    await status_msg.edit_text(
-        f"✅ Added to batch: `{episode_note}`"
-        + (f" [{guess_quality}]" if guess_quality else "")
+    await message.reply_text(
+        f"✅ Added to batch: `{episode}`"
+        + (f" [{pending['quality']}]" if pending["quality"] else "")
         + f"\n{len(session['episodes'])} file(s) collected so far. Send more, or `/batch done` to finish."
     )
 
@@ -923,7 +1058,9 @@ async def handle_help(client: Client, message: Message):
         "• `/pick <number>` — choose from a TMDB shortlist if multiple matches came up\n\n"
         "**Batch mode** (for season packs / many episodes at once):\n"
         "• `/batch start` — begin collecting; forward all episodes, each uploads "
-        "immediately without asking for confirm\n"
+        "immediately, then asks you to confirm the episode number with `/setepisode <value>`\n"
+        "• `/setepisode <value>` — answer the episode prompt after a batch upload "
+        "(e.g. `/setepisode S01E03`)\n"
         "• `/batch status` — see what's been collected so far\n"
         "• `/batch done` — finish collecting and move to one shared confirm step\n"
         "• `/batchconfirm`, `/batchpick <number>`, `/batchedit <title> | <year> | <category>` "
@@ -1139,6 +1276,7 @@ async def _do_publish(message: Message, pending: dict, extra_fields: dict = None
             pending.get("category", "series"),
             extra_fields,
             pending.get("quality", ""),
+            pending.get("file_size_bytes", 0),
         )
         action = result["action"]
         if action == "created":
@@ -1347,6 +1485,7 @@ async def _do_batch_publish(message: Message, pending: dict, extra_fields: dict 
                 pending.get("category", "series"),
                 extra_fields,
                 ep.get("quality", ""),
+                ep.get("file_size_bytes", 0),
             )
             published.append((ep, result["action"]))
         except Exception as e:
