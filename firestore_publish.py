@@ -32,6 +32,20 @@ MATCHING LOGIC:
   panel to ones created by hand, including the placeholder Streamtape-era
   fields (unused for Doodstream, but kept so existing admin.js rendering
   code that reads link.streamtapeStatus etc. doesn't choke on missing keys).
+
+EPISODE FORMAT:
+  Episodes are tracked and matched everywhere in this bot (dedup checks,
+  /edit, inference, Telegram messages) using the compact "S01E02" form,
+  since that's compact, sortable, and easy to parse back out of a
+  filename/caption. The *site's* link builder, however, expects a plain
+  "Episode 2" label in each link's episode field (see admin.html's
+  Episode / Server Link Builder screenshots) -- it doesn't understand or
+  re-render "S01E02". build_link_entry() is the single place that
+  converts from the internal S01E02 form to the site-facing "Episode N"
+  form, right at the point a link entry is built for Firestore. Nothing
+  upstream of that (dedup, inference, etc.) needs to change, since they
+  all operate on the internal form via the `episode` argument callers
+  pass in.
 """
 
 import os
@@ -184,6 +198,12 @@ def infer_next_episode(title: str) -> str:
         actually a movie, or uses a numbering scheme this doesn't
         recognize) -- guessing wrong here would mislabel content, so we
         simply decline to guess rather than risk it.
+
+    NOTE: this reads the "episode" field back off of existing directLinks
+    entries, which (as of this bot version) are stored in the site-facing
+    "Episode N" form rather than "S01E02" -- see build_link_entry(). To
+    keep inference working against both older docs (still S01E02-shaped)
+    and newer ones, the highest-episode scan below tries both forms.
     """
     db = _db or init_firebase()
     slug = slugify(title)
@@ -199,10 +219,13 @@ def infer_next_episode(title: str) -> str:
 
     best_season, best_episode = None, None
     for link in links:
-        match = _EPISODE_RE.match((link.get("episode") or "").strip())
-        if not match:
+        raw_episode = (link.get("episode") or "").strip()
+        season_num, episode_num = _parse_any_episode_format(raw_episode)
+        if episode_num is None:
             continue
-        season_num, episode_num = int(match.group(1)), int(match.group(2))
+        # Season defaults to 1 when the stored form doesn't carry a season
+        # number at all (the site-facing "Episode N" form doesn't).
+        season_num = season_num or 1
         if best_season is None or (season_num, episode_num) > (best_season, best_episode):
             best_season, best_episode = season_num, episode_num
 
@@ -212,7 +235,42 @@ def infer_next_episode(title: str) -> str:
     return f"S{best_season:02d}E{best_episode + 1:02d}"
 
 
+def _parse_any_episode_format(raw_episode: str):
+    """Parse either the internal 'S01E02' form or the site-facing
+    'Episode 2' form into (season_or_None, episode_number_or_None).
+    Used only by infer_next_episode's back-compat scan.
+    """
+    if not raw_episode:
+        return None, None
+    m = _EPISODE_RE.match(raw_episode)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.match(r"^Episode\s+(\d{1,3})$", raw_episode, re.IGNORECASE)
+    if m:
+        return None, int(m.group(1))
+    return None, None
 
+
+def format_episode_for_site(episode: str) -> str:
+    """Convert the internal 'S01E02' episode form into the plain
+    'Episode 2' label the site's Episode / Server Link Builder expects
+    (see admin.html screenshots -- fields read "episode 1", "episode 2",
+    not "S01E01"). Season info is intentionally dropped since the site
+    has no season concept in this field; multi-season series are handled
+    by "Add Episode Group" on the site side, not by this bot.
+
+    Non-S##E##-shaped input (already plain text, or something unexpected)
+    is passed through unchanged, since guessing at reformatting something
+    that doesn't match the expected shape risks mangling it worse than
+    leaving it alone.
+    """
+    if not episode:
+        return episode
+    match = _EPISODE_RE.match(episode.strip())
+    if not match:
+        return episode
+    episode_num = int(match.group(2))
+    return f"Episode {episode_num}"
 
 
 def detect_quality(source_text: str) -> str:
@@ -233,6 +291,21 @@ def detect_quality(source_text: str) -> str:
     return tag
 
 
+def format_file_size(num_bytes: int) -> str:
+    """Human-readable file size for the site's 'File Size (e.g., 450MB)'
+    field, e.g. 1_363_148_800 -> '1.3GB'. Uses binary (1024-based) units
+    to match how Telegram/most OSes report file sizes, and picks MB vs GB
+    based on magnitude so small files don't show as '0.1GB' and large
+    ones don't show as '1400MB'.
+    """
+    if not num_bytes or num_bytes <= 0:
+        return ""
+    mb = num_bytes / (1024 ** 2)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f}GB"
+    return f"{mb:.0f}MB"
+
+
 def find_series_by_slug(db, slug: str):
     """Look up an existing movies/ doc by its stored slug field."""
     query = db.collection(ROOT_COLLECTION).where("slug", "==", slug).limit(1)
@@ -251,6 +324,11 @@ def check_existing_episode(title: str, episode: str) -> dict:
     that's only knowable after a Doodstream URL already exists). Here we
     can only go by title+episode, since that's all that's available
     before the file has been uploaded anywhere.
+
+    `episode` here is always the internal 'S01E02' form (this is called
+    before build_link_entry ever converts anything), so comparisons
+    against stored links use _parse_any_episode_format for back-compat
+    with the site-facing 'Episode N' form now written by build_link_entry.
 
     Returns {"exists": False} or
             {"exists": True, "doc_id": "...", "title": "...",
@@ -274,8 +352,17 @@ def check_existing_episode(title: str, episode: str) -> dict:
     if not episode:
         return {"exists": True, "doc_id": existing.id, "title": data.get("title", title), "episode": None}
 
+    _, wanted_episode_num = _parse_any_episode_format(episode)
+
     for link in links:
-        if link.get("episode") == episode:
+        stored = (link.get("episode") or "").strip()
+        if stored == episode:
+            return {"exists": True, "doc_id": existing.id, "title": data.get("title", title), "episode": episode}
+        # Also match across formats (internal S01E02 vs site-facing
+        # "Episode N"), so a duplicate check doesn't miss an episode just
+        # because it's stored in the newer site-facing form.
+        _, stored_episode_num = _parse_any_episode_format(stored)
+        if wanted_episode_num is not None and stored_episode_num == wanted_episode_num:
             return {"exists": True, "doc_id": existing.id, "title": data.get("title", title), "episode": episode}
 
     return {"exists": False}
@@ -385,9 +472,16 @@ def build_link_entry(episode: str, server: str, url: str) -> dict:
     so entries the bot writes render identically in the admin panel.
     The streamtape* fields are Streamtape-pipeline leftovers unused by
     Doodstream, but kept null (not omitted) since admin.js UI code reads
-    link.streamtapeStatus directly without an existence check."""
+    link.streamtapeStatus directly without an existence check.
+
+    `episode` is accepted in the bot's internal 'S01E02' form (or None
+    for a movie) and converted here to the site-facing 'Episode N' label
+    via format_episode_for_site -- this is the one place that conversion
+    happens, so every caller elsewhere in the bot keeps working with the
+    internal form.
+    """
     return {
-        "episode": episode,
+        "episode": format_episode_for_site(episode) if episode else episode,
         "server": server,
         "sourceUrl": url,
         "streamtapeStatus": None,
@@ -401,7 +495,7 @@ def format_links_block(links: list) -> str:
     """Python port of the line-building loop inside
     js/admin.js: generateSynopsisFromBuilder() -- NOT the whole function,
     just the part that turns directLinks rows into text lines:
-        S01E01
+        Episode 1
         Download link: https://dood.to/d/abc
         Download link: https://dood.to/d/xyz   (no repeated episode line
                                                   if it matches the previous row)
@@ -411,6 +505,10 @@ def format_links_block(links: list) -> str:
     name (e.g. "Doodstream") -- this is a display choice for the site's
     synopsis text, independent of the `server` field itself, which still
     stores the real hoster name for any other logic that needs it.
+
+    Links' `episode` field is already in the site-facing "Episode N" form
+    by the time it reaches here (build_link_entry converts it), so no
+    further conversion is needed in this function.
     """
     lines = []
     last_episode = None
@@ -472,7 +570,8 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
                              server_label: str = "Doodstream",
                              category: str = "series",
                              extra_fields: dict = None,
-                             quality: str = "") -> dict:
+                             quality: str = "",
+                             file_size_bytes: int = 0) -> dict:
     """Create-or-append the finished Doodstream link into Firestore.
 
     quality, if given (e.g. "1080p" from detect_quality()), sets the
@@ -488,6 +587,19 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     existing series, so re-confirming an episode for an already-published
     series never silently overwrites admin-edited fields like a
     hand-picked poster or corrected synopsis.
+
+    file_size_bytes, if given, is the raw Telegram file size for this
+    upload. It's used as a fallback for the doc's `size` field only when
+    TMDB didn't already supply one via extra_fields (TMDB movie/tv detail
+    responses essentially never include a file size, so in practice this
+    fallback is what actually populates the field most of the time -- see
+    format_file_size). Like quality/p1080, size is only ever set from
+    within this function on doc creation; it's not re-derived or
+    overwritten on append, since a series' "size" field describes
+    whichever single file (or nominal size) was recorded when the entry
+    was first created, and silently changing it every time a new episode
+    with a different file size is appended would be more confusing than
+    useful.
 
     Returns a dict describing what happened, e.g.:
         {"action": "appended", "doc_id": "...", "slug": "..."}
@@ -509,10 +621,12 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
         links = data.get("directLinks", []) or []
 
         # Avoid duplicate entries if the same episode+url is re-processed
-        # (e.g. bot restart re-handling an already-uploaded file).
+        # (e.g. bot restart re-handling an already-uploaded file). Compare
+        # by the already-converted site-facing episode label here, since
+        # that's the form both the new and existing entries are stored in.
         already_present = any(
             l.get("sourceUrl") == doodstream_url or
-            (episode and l.get("episode") == episode and l.get("server") == server_label)
+            (new_link["episode"] and l.get("episode") == new_link["episode"] and l.get("server") == server_label)
             for l in links
         )
         if already_present:
@@ -565,11 +679,21 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
         allowed_keys = {
             "title", "year", "image", "backdrop", "description", "duration",
             "genre", "genres", "trailer", "director", "contentRating",
-            "voteAverage", "cast", "language",
+            "voteAverage", "cast", "language", "size",
         }
         for key, value in extra_fields.items():
             if key in allowed_keys and value not in (None, "", []):
                 payload[key] = value
+
+    # File size: prefer whatever TMDB supplied (rare, but respected if
+    # present via extra_fields above), otherwise fall back to the actual
+    # Telegram file size of this upload -- this is the field admin.html
+    # labels "File Size (e.g., 450MB)" and, per the screenshots, is
+    # otherwise left for the admin to type in by hand every time.
+    if not payload.get("size") and file_size_bytes:
+        formatted_size = format_file_size(file_size_bytes)
+        if formatted_size:
+            payload["size"] = formatted_size
 
     # Build the initial description exactly like admin.html's "Generate
     # Synopsis" button would: TMDB synopsis (if any) followed by the
