@@ -46,6 +46,18 @@ EPISODE FORMAT:
   upstream of that (dedup, inference, etc.) needs to change, since they
   all operate on the internal form via the `episode` argument callers
   pass in.
+
+CATEGORY VALUES:
+  The site (js/admin.js) stores non-series entries with category ==
+  "movies" (plural) -- see admCategory's <option value="movies"> and every
+  `item.category !== "series"` / `item.category === "series"` check in
+  admin.js's Catalog Ledger filter and stats strip. This module and
+  main.py write "movies"/"series" to match. (An earlier version of this
+  bot wrote singular "movie", which silently fell through admin.html's
+  "Movies only" filter since it only ever matches "series" or falls back
+  to "not series" -- "movie" != "series" so it still displayed under "All",
+  just not under the movies-only filter. If you have older bot-published
+  docs with category "movie", see migrate_movie_category_typos() below.)
 """
 
 import os
@@ -601,6 +613,9 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     with a different file size is appended would be more confusing than
     useful.
 
+    category should be "movies" or "series" (matching the site's stored
+    values -- see the CATEGORY VALUES note at the top of this file).
+
     Returns a dict describing what happened, e.g.:
         {"action": "appended", "doc_id": "...", "slug": "..."}
         {"action": "created",  "doc_id": "...", "slug": "..."}
@@ -705,7 +720,321 @@ def publish_doodstream_link(title: str, episode: str, doodstream_url: str,
     return {"action": "created", "doc_id": doc_ref.id, "slug": slug}
 
 
-PENDING_TORRENT_COLLECTION = "pending_torrent_uploads"
+# ── Catalog editing / deletion ───────────────────────────────────────────
+# Mirrors admin.html's Catalog Ledger edit (pencil) / delete (trash)
+# actions -- see js/admin.js: triggerAdminEdit / triggerAdminDelete /
+# executeAdminMovieUpload's updateDoc branch. Unlike the web form (which
+# always writes every field, since it's a full form re-render), these are
+# PARTIAL updates: only fields explicitly named by the admin are touched,
+# since a chat command has no pre-populated form to submit in full.
+
+# field -> Python type its value should be coerced to before writing.
+# "str" fields are passed through as-is (already strings from Telegram
+# text). Anything not listed here is rejected by parse_edit_field, rather
+# than silently writing an unexpected key that admin.js's rendering code
+# doesn't know about.
+_EDITABLE_FIELD_TYPES = {
+    "title": "str",       # NOTE: does not re-slug or move the doc -- see parse_edit_field
+    "year": "str",
+    "size": "str",
+    "genre": "str",
+    "category": "category",
+    "description": "str",
+    "image": "str",
+    "backdrop": "str",
+    "trailer": "str",
+    "duration": "str",
+    "language": "str",
+    "director": "str",
+    "contentRating": "str",
+    "voteAverage": "float",
+    "p1080": "bool",
+    "isFeatured": "bool",
+    "isTrending": "bool",
+    "isNewRelease": "bool",
+    "isRecommended": "bool",
+}
+
+
+def parse_edit_field(field: str, raw_value: str):
+    """Validate and coerce one `/edittitle` field=value argument.
+    Raises ValueError with a human-readable message on anything invalid,
+    which handle_edit_title in main.py surfaces directly to the admin.
+    """
+    if field not in _EDITABLE_FIELD_TYPES:
+        raise ValueError(
+            f"`{field}` isn't an editable field. Editable: {', '.join(sorted(_EDITABLE_FIELD_TYPES))}"
+        )
+
+    kind = _EDITABLE_FIELD_TYPES[field]
+
+    if kind == "str":
+        return raw_value  # empty string is valid -- clears the field
+
+    if kind == "bool":
+        lowered = raw_value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"`{field}` must be true/false, got `{raw_value}`")
+
+    if kind == "float":
+        try:
+            return float(raw_value)
+        except ValueError:
+            raise ValueError(f"`{field}` must be a number, got `{raw_value}`")
+
+    if kind == "category":
+        val = raw_value.strip().lower()
+        if val not in ("movies", "series"):
+            raise ValueError(f"`{field}` must be `movies` or `series`, got `{raw_value}`")
+        return val
+
+    raise ValueError(f"Unhandled field type for `{field}`")  # pragma: no cover
+
+
+def get_title_snapshot(title: str) -> dict:
+    """Fetch the full current field values for a published title, by
+    slug match on the given title text. Returns a dict with all stored
+    fields plus "id" (the doc id), or None if no match. Used by /lookup
+    (to show current values) and /deletetitle (to confirm what's about
+    to be deleted).
+    """
+    db = _db or init_firebase()
+    slug = slugify(title)
+    if not slug:
+        return None
+
+    existing = find_series_by_slug(db, slug)
+    if not existing:
+        return None
+
+    data = existing.to_dict() or {}
+    data["id"] = existing.id
+    return data
+
+
+def update_title_fields(title: str, updates: dict) -> dict:
+    """Apply a partial field update to an existing published title,
+    found by slug match on `title`. `updates` must already be validated/
+    coerced (see parse_edit_field) -- this function just writes them.
+
+    Renaming via the `title` field is intentionally NOT supported here:
+    changing title would also need to move the doc to a new slug (the
+    site looks docs up by slug, see find_series_by_slug/middleware.js),
+    and silently reslugging risks breaking any external links already
+    pointing at the old slug. If a rename is genuinely needed, do it in
+    admin.html where the slug-collision check (updateSlugPreview) is
+    visible before saving.
+
+    Returns {"found": False} if no matching title exists, or
+            {"found": True, "doc_id": "...", "title": "..."}
+    """
+    db = _db or init_firebase()
+    slug = slugify(title)
+    if not slug:
+        return {"found": False}
+
+    existing = find_series_by_slug(db, slug)
+    if not existing:
+        return {"found": False}
+
+    write_updates = dict(updates)
+    if "title" in write_updates:
+        # Reject rather than silently drop -- the admin explicitly asked
+        # for this and deserves to know why it didn't happen, rather than
+        # having every OTHER field in the same command applied while this
+        # one vanishes with no trace.
+        raise ValueError(
+            "Renaming via `title=` isn't supported (it would also need to move "
+            "the doc to a new slug, which risks breaking existing links). "
+            "Rename it in admin.html instead, where the slug-collision check "
+            "is visible before saving."
+        )
+
+    existing.reference.update(write_updates)
+    data = existing.to_dict() or {}
+    logger.info("Updated doc %s (title=%r) fields: %s", existing.id, title, list(write_updates))
+
+    return {"found": True, "doc_id": existing.id, "title": data.get("title", title)}
+
+
+def delete_title(doc_id: str) -> dict:
+    """Permanently delete a movies/ doc by id. Mirrors admin.js's
+    triggerAdminDelete (deleteDoc) exactly -- no soft-delete, no
+    recycle bin, matching the site's own behavior.
+
+    Takes a doc_id (not a title) since the caller (handle_delete_title in
+    main.py) already resolved and confirmed the exact doc via
+    get_title_snapshot before calling this -- looking up by title a
+    second time here would re-open the door to a title-text race (e.g.
+    two similarly-named titles) that the confirm step exists to close.
+
+    Returns {"found": False} if the doc no longer exists (e.g. already
+    deleted by a second concurrent request), or
+            {"found": True, "title": "..."}
+    """
+    db = _db or init_firebase()
+    doc_ref = db.collection(ROOT_COLLECTION).document(doc_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        return {"found": False}
+
+    data = snap.to_dict() or {}
+    title = data.get("title", "Untitled")
+    doc_ref.delete()
+    logger.info("Deleted doc %s (title=%r)", doc_id, title)
+    return {"found": True, "title": title}
+
+
+def migrate_movie_category_typos(dry_run: bool = True) -> dict:
+    """One-off cleanup for docs published by an earlier version of this
+    bot that wrote category="movie" (singular) instead of the site's
+    "movies" (plural) -- see the CATEGORY VALUES note at the top of this
+    file. Run manually, not called anywhere in the bot's normal flow:
+
+        python3 -c "import firestore_publish as f; f.init_firebase(); \
+                     print(f.migrate_movie_category_typos(dry_run=True))"
+
+    Review the dry-run output, then re-run with dry_run=False to actually
+    apply the fix.
+
+    Returns {"matched": [...doc ids/titles...], "updated": bool}
+    """
+    db = _db or init_firebase()
+    query = db.collection(ROOT_COLLECTION).where("category", "==", "movie")
+    matched = []
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        matched.append({"doc_id": doc.id, "title": data.get("title", "Untitled")})
+        if not dry_run:
+            doc.reference.update({"category": "movies"})
+
+    if dry_run:
+        logger.info("migrate_movie_category_typos: found %d doc(s) with category='movie' (dry run, nothing changed)",
+                     len(matched))
+    else:
+        logger.info("migrate_movie_category_typos: updated %d doc(s) from category='movie' to 'movies'",
+                     len(matched))
+
+    return {"matched": matched, "updated": not dry_run}
+
+
+# ── Announcements ─────────────────────────────────────────────────────────
+# Mirrors admin.html's Announcement tab (see js/admin.js:
+# executeAdminAnnouncementUpload) -- a single site-wide banner doc at
+# announcements/siteAnnouncement, shown in a dismissible bar at the top
+# of every page when isActive is true. Unlike catalog editing, this is a
+# single fixed doc (setDoc, full overwrite), not a partial-update-by-id
+# lookup, so there's no separate "find the doc" step.
+
+ANNOUNCEMENT_TONES = ("info", "success", "warning", "alert")
+_ANNOUNCEMENT_DOC = ("announcements", "siteAnnouncement")
+
+
+def get_announcement() -> dict:
+    """Fetch the current site announcement doc, or a dict of defaults
+    (all empty, isActive False) if none has ever been set -- mirrors
+    admin.html's load path (see the getDoc call around line 543), which
+    leaves the form blank rather than erroring when the doc doesn't
+    exist yet.
+    """
+    db = _db or init_firebase()
+    snap = db.collection(_ANNOUNCEMENT_DOC[0]).document(_ANNOUNCEMENT_DOC[1]).get()
+    if not snap.exists:
+        return {"title": "", "message": "", "tone": "info", "linkUrl": "", "linkLabel": "", "isActive": False}
+    data = snap.to_dict() or {}
+    return {
+        "title": data.get("title", ""),
+        "message": data.get("message", ""),
+        "tone": data.get("tone", "info"),
+        "linkUrl": data.get("linkUrl", ""),
+        "linkLabel": data.get("linkLabel", ""),
+        "isActive": bool(data.get("isActive", False)),
+    }
+
+
+def set_announcement(message: str, title: str = "", tone: str = "info",
+                      link_url: str = "", link_label: str = "",
+                      is_active: bool = None) -> dict:
+    """Write the site announcement doc. Full overwrite (setDoc, matching
+    admin.html), not a partial update -- every field is written every
+    time, since the announcement is one small form, not a large record
+    where a partial patch is worth supporting.
+
+    message is required (mirrors the form's `required` attribute + 220
+    char maxlength) and truncated to 220 chars rather than rejected
+    outright for a slight overage, since a chat message is easy to paste
+    a little long by accident. title is capped at 40 chars, link_label
+    at 30, matching the form's maxlength attributes.
+
+    is_active, if None, PRESERVES whatever the current doc's isActive
+    value is (so `/announce <message>` alone doesn't silently flip a
+    currently-live announcement off, or a currently-hidden one on) --
+    this is the one place this function's behavior deliberately departs
+    from admin.html's plain setDoc, since the web form always has an
+    explicit checkbox state to submit and a chat command doesn't unless
+    the admin says so.
+
+    Returns {"ok": True, "isActive": bool}.
+    """
+    db = _db or init_firebase()
+
+    tone = (tone or "info").strip().lower()
+    if tone not in ANNOUNCEMENT_TONES:
+        raise ValueError(f"tone must be one of {', '.join(ANNOUNCEMENT_TONES)}, got {tone!r}")
+
+    message = (message or "").strip()[:220]
+    if not message:
+        raise ValueError("message can't be empty")
+
+    if is_active is None:
+        current = get_announcement()
+        is_active = current["isActive"]
+
+    payload = {
+        "title": (title or "").strip()[:40],
+        "message": message,
+        "tone": tone,
+        "linkUrl": (link_url or "").strip(),
+        "linkLabel": (link_label or "").strip()[:30],
+        "isActive": bool(is_active),
+        "updatedAt": _firestore.SERVER_TIMESTAMP,
+    }
+    db.collection(_ANNOUNCEMENT_DOC[0]).document(_ANNOUNCEMENT_DOC[1]).set(payload)
+    logger.info("Announcement updated (isActive=%s, tone=%s)", payload["isActive"], tone)
+    return {"ok": True, "isActive": payload["isActive"]}
+
+
+def set_announcement_active(is_active: bool) -> dict:
+    """Flip just the isActive flag on the existing announcement doc,
+    without touching message/title/tone/link -- for /announceon and
+    /announceoff, which shouldn't require re-typing the whole message
+    just to toggle visibility.
+
+    Uses `update` (partial), not `set` (full overwrite) -- unlike
+    set_announcement above, which always rewrites every field to match
+    admin.html's form-submit behavior, this is specifically for the
+    "just flip the switch" case.
+
+    Raises ValueError if no announcement has ever been created (nothing
+    to toggle) -- mirrors the fact that /announceon before any /announce
+    would otherwise show an empty banner to every visitor, which is
+    almost certainly not what was intended.
+    """
+    db = _db or init_firebase()
+    doc_ref = db.collection(_ANNOUNCEMENT_DOC[0]).document(_ANNOUNCEMENT_DOC[1])
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise ValueError("No announcement has been set yet. Use `/announce <message>` first.")
+
+    doc_ref.update({"isActive": bool(is_active), "updatedAt": _firestore.SERVER_TIMESTAMP})
+    logger.info("Announcement isActive set to %s", is_active)
+    return {"ok": True, "isActive": bool(is_active)}
+
+
+
 
 
 def fetch_unprocessed_torrent_uploads(limit: int = 10) -> list:
