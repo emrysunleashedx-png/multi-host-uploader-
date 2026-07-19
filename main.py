@@ -98,6 +98,14 @@ BATCH_PENDING_PUBLISH = {}
 # file, since there's only one pending slot per chat).
 PENDING_BATCH_EPISODE = {}
 
+# Holds a matched catalog doc (id + current field snapshot) that's
+# awaiting an /edittitle or /deletetitle confirmation, keyed by chat_id.
+# Populated by /lookup and /deletetitle (pre-confirm); consumed by
+# /edittitle and the /deletetitle confirm step. See handle_lookup,
+# handle_edit_title, handle_delete_title.
+PENDING_CATALOG_EDIT = {}
+PENDING_CATALOG_DELETE = {}
+
 app = Client("multi_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 HEADERS = {
@@ -657,7 +665,7 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
         "url": result_url,
         "server": host,
         "year": None,
-        "category": "series" if guess_episode else "movie",
+        "category": "series" if guess_episode else "movies",
         "quality": guess_quality,
         "episode_was_inferred": episode_was_inferred,
         "tmdb_candidates": None,  # populated once /confirm triggers a TMDB search
@@ -684,7 +692,7 @@ async def _download_and_upload(client: Client, message: Message, guess_title: st
         "`/edit <title> | <episode> | <year> | <category> | <quality>` to correct it first.\n"
         "All parts after title are optional, e.g.:\n"
         "`/edit The Scarecrow | S01E02`\n"
-        "`/edit Parasite | | 2019 | movie`"
+        "`/edit Parasite | | 2019 | movies`"
     )
     await status_msg.edit_text(response)
 
@@ -1054,7 +1062,7 @@ async def handle_help(client: Client, message: Message):
         "Then after it finishes uploading:\n"
         "• `/confirm` — look the guessed title up on TMDB and publish\n"
         "• `/edit <title> | <episode> | <year> | <category> | <quality>` — correct the guess first "
-        "(only title is required, e.g. `/edit Parasite | | 2019 | movie`)\n"
+        "(only title is required, e.g. `/edit Parasite | | 2019 | movies`)\n"
         "• `/pick <number>` — choose from a TMDB shortlist if multiple matches came up\n\n"
         "**Batch mode** (for season packs / many episodes at once):\n"
         "• `/batch start` — begin collecting; forward all episodes, each uploads "
@@ -1067,6 +1075,17 @@ async def handle_help(client: Client, message: Message):
         "— same as /confirm, /pick, /edit but apply to the whole batch at once\n"
         "• `/batch cancel` — discard a batch (already-uploaded Doodstream links aren't deleted, "
         "just not published)\n\n"
+        "**Catalog management** (editing/removing things already on the site):\n"
+        "• `/lookup <title>` — show the current field values for a published title\n"
+        "• `/edittitle <title> | field=value | field=value | ...` — update specific fields "
+        "on an existing title (e.g. `/edittitle The Scarecrow | year=2024 | genre=Drama`)\n"
+        "• `/deletetitle <title>` — permanently delete a title (asks for confirmation first)\n\n"
+        "**Announcements** (site-wide dismissible banner):\n"
+        "• `/announce <message>` — set the banner message (keeps current on/off state)\n"
+        "• `/announce <message> | <title> | <tone> | <linkUrl> | <linkLabel>` — full form "
+        "(tone: info/success/warning/alert)\n"
+        "• `/announceon`, `/announceoff` — show/hide the banner without retyping it\n"
+        "• `/announcestatus` — see the current banner text and on/off state\n\n"
         "Other commands:\n"
         "• `/status` or `/pending` — see what's currently awaiting confirmation\n"
         "• `/find <title>` — check if something's already published on the site\n"
@@ -1209,7 +1228,7 @@ async def handle_edit(client: Client, message: Message):
             "Usage: `/edit <title> | <episode> | <year> | <category> | <quality>`\n"
             "Only title is required. Examples:\n"
             "`/edit The Scarecrow | S01E02`\n"
-            "`/edit Parasite | | 2019 | movie`\n"
+            "`/edit Parasite | | 2019 | movies`\n"
             "`/edit The Scarecrow | S01E02 | | | 1080p`"
         )
         return
@@ -1225,8 +1244,8 @@ async def handle_edit(client: Client, message: Message):
         await message.reply_text("Title can't be empty.")
         return
 
-    if category and category not in ("movie", "series"):
-        await message.reply_text("Category must be `movie` or `series`.")
+    if category and category not in ("movies", "series"):
+        await message.reply_text("Category must be `movies` or `series`.")
         return
 
     if quality and quality.lower() not in ("2160p", "4k", "1080p", "720p", "480p"):
@@ -1236,12 +1255,12 @@ async def handle_edit(client: Client, message: Message):
         quality = "2160p" if quality.lower() == "4k" else quality.lower()
 
     # A movie has no episode by definition -- if the admin explicitly sets
-    # category to "movie" (whether just now or previously), don't let a
+    # category to "movies" (whether just now or previously), don't let a
     # stale episode value from an earlier /edit or the caption guess leak
     # through just because this /edit call happened to leave that segment
     # blank.
     final_category = category or "series"
-    if final_category == "movie":
+    if final_category == "movies":
         episode = None
 
     pending["title"] = title
@@ -1328,8 +1347,8 @@ async def handle_batch_edit(client: Client, message: Message):
     if not title:
         await message.reply_text("Title can't be empty.")
         return
-    if category and category not in ("movie", "series"):
-        await message.reply_text("Category must be `movie` or `series`.")
+    if category and category not in ("movies", "series"):
+        await message.reply_text("Category must be `movies` or `series`.")
         return
 
     pending["title"] = title
@@ -1511,6 +1530,321 @@ async def _do_batch_publish(message: Message, pending: dict, extra_fields: dict 
     await status.edit_text("\n".join(lines))
 
 
+# ── Catalog editing / deletion ─────────────────────────────────────────────
+# Mirrors admin.html's "Edit" (pencil) and "Delete" (trash) buttons in the
+# Catalog Ledger (see js/admin.js: triggerAdminEdit / triggerAdminDelete).
+# The web admin edits via a full form re-render; here the equivalent is a
+# `/lookup` to see current values, then `/edittitle` with just the fields
+# you want to change (unset fields are left exactly as they are -- this is
+# a partial update, not a full overwrite, since there's no form UI to
+# pre-populate from in a chat).
+
+EDITABLE_FIELDS_HELP = (
+    "Editable fields: title, year, size, genre, category (movies/series), "
+    "description, image (poster URL), backdrop, trailer, duration, language, "
+    "director, contentRating, voteAverage, p1080, isFeatured, isTrending, "
+    "isNewRelease, isRecommended"
+)
+
+
+@app.on_message(filters.private & filters.command("lookup"))
+async def handle_lookup(client: Client, message: Message):
+    raw = message.text.split(None, 1)
+    title = raw[1].strip() if len(raw) > 1 else ""
+    if not title:
+        await message.reply_text("Usage: `/lookup <title>` -- e.g. `/lookup The Scarecrow`")
+        return
+
+    status = await message.reply_text(f"🔎 Looking up \"{title}\"...")
+    try:
+        doc = await asyncio.to_thread(firestore_publish.get_title_snapshot, title)
+    except Exception as e:
+        logger.exception("Lookup failed")
+        await status.edit_text(f"❌ Lookup failed: {type(e).__name__}: {e}")
+        return
+
+    if not doc:
+        await status.edit_text(
+            f"No published title matching `{title}` found. Try `/find <title>` "
+            "if you're not sure of the exact title."
+        )
+        return
+
+    # Stash so /edittitle and /deletetitle don't need to re-look-up by
+    # title text (avoids acting on a different doc if two titles are
+    # similar) -- both commands still take a title argument for clarity,
+    # but this snapshot is what confirms which exact doc was meant.
+    PENDING_CATALOG_EDIT[message.chat.id] = {"doc_id": doc["id"], "title": doc.get("title")}
+
+    lines = [f"📋 **{doc.get('title', 'Untitled')}** (`{doc['id']}`)", ""]
+    for key in ("category", "year", "size", "genre", "p1080",
+                "isFeatured", "isTrending", "isNewRelease", "isRecommended",
+                "director", "contentRating", "voteAverage", "duration", "language",
+                "image", "backdrop", "trailer"):
+        val = doc.get(key)
+        if val in (None, "", []):
+            continue
+        lines.append(f"• {key}: `{val}`")
+    desc = (doc.get("description") or "").strip()
+    if desc:
+        preview = desc if len(desc) <= 200 else desc[:200] + "…"
+        lines.append(f"• description: {preview}")
+    links = doc.get("directLinks") or []
+    lines.append(f"• directLinks: {len(links)} link(s) (use the batch/edit flow to add more, not `/edittitle`)")
+
+    lines.append("")
+    lines.append(EDITABLE_FIELDS_HELP)
+    lines.append(
+        f"\nReply `/edittitle {doc.get('title')} | field=value | field=value` to update, "
+        f"or `/deletetitle {doc.get('title')}` to delete."
+    )
+    await status.edit_text("\n".join(lines))
+
+
+@app.on_message(filters.private & filters.command("edittitle"))
+async def handle_edit_title(client: Client, message: Message):
+    raw = message.text.split(None, 1)
+    args = raw[1] if len(raw) > 1 else ""
+    if not args.strip() or "|" not in args:
+        await message.reply_text(
+            "Usage: `/edittitle <title> | field=value | field=value | ...`\n"
+            f"{EDITABLE_FIELDS_HELP}\n\n"
+            "Examples:\n"
+            "`/edittitle The Scarecrow | year=2024 | genre=Drama`\n"
+            "`/edittitle Parasite | isFeatured=true | p1080=true`\n\n"
+            "Tip: run `/lookup <title>` first to see current values and the exact stored title."
+        )
+        return
+
+    parts = [p.strip() for p in args.split("|")]
+    title = parts[0]
+    field_args = parts[1:]
+
+    if not title:
+        await message.reply_text("Title can't be empty.")
+        return
+    if not field_args:
+        await message.reply_text("Give at least one `field=value` to update.")
+        return
+
+    updates = {}
+    errors = []
+    for part in field_args:
+        if "=" not in part:
+            errors.append(f"`{part}` -- expected `field=value`")
+            continue
+        field, _, value = part.partition("=")
+        field = field.strip()
+        value = value.strip()
+        try:
+            parsed = firestore_publish.parse_edit_field(field, value)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        updates[field] = parsed
+
+    if errors:
+        await message.reply_text(
+            "❌ Couldn't parse some fields:\n" + "\n".join(f"• {e}" for e in errors) +
+            f"\n\n{EDITABLE_FIELDS_HELP}"
+        )
+        return
+
+    status = await message.reply_text(f"📡 Updating \"{title}\"...")
+    try:
+        result = await asyncio.to_thread(firestore_publish.update_title_fields, title, updates)
+    except Exception as e:
+        logger.exception("Edit failed")
+        await status.edit_text(f"❌ Update failed: {type(e).__name__}: {e}")
+        return
+
+    if not result.get("found"):
+        await status.edit_text(
+            f"Couldn't find a published title matching `{title}`. "
+            "Try `/find <title>` or `/lookup <title>` to check the exact title first."
+        )
+        return
+
+    field_summary = ", ".join(f"{k}={v}" for k, v in updates.items())
+    await status.edit_text(f"✅ Updated `{result['title']}` — {field_summary}")
+
+
+@app.on_message(filters.private & filters.command("deletetitle"))
+async def handle_delete_title(client: Client, message: Message):
+    raw = message.text.split(None, 1)
+    title = raw[1].strip() if len(raw) > 1 else ""
+    if not title:
+        await message.reply_text("Usage: `/deletetitle <title>` -- e.g. `/deletetitle The Scarecrow`")
+        return
+
+    # First call: look the title up, stash it, ask for confirmation.
+    # Second call (admin replies /deletetitle again with the SAME title,
+    # or /confirmdelete): actually deletes. This mirrors admin.html's
+    # `confirm("Permanently delete this movie?")` native dialog -- a chat
+    # command has no equivalent modal, so a second explicit step stands in
+    # for it. Requiring the title to match again (not just any /deletetitle)
+    # guards against a stray second tap deleting something else if the
+    # admin moved on to looking up a different title in between.
+    pending = PENDING_CATALOG_DELETE.get(message.chat.id)
+    if pending and pending["title_query"].lower() == title.lower():
+        status = await message.reply_text(f"🗑️ Deleting \"{pending['title']}\"...")
+        try:
+            result = await asyncio.to_thread(firestore_publish.delete_title, pending["doc_id"])
+        except Exception as e:
+            logger.exception("Delete failed")
+            await status.edit_text(f"❌ Delete failed: {type(e).__name__}: {e}")
+            return
+        PENDING_CATALOG_DELETE.pop(message.chat.id, None)
+        if not result.get("found"):
+            await status.edit_text("That entry no longer exists (may have already been deleted).")
+            return
+        await status.edit_text(f"✅ Deleted `{result['title']}` permanently.")
+        return
+
+    status = await message.reply_text(f"🔎 Looking up \"{title}\"...")
+    try:
+        doc = await asyncio.to_thread(firestore_publish.get_title_snapshot, title)
+    except Exception as e:
+        logger.exception("Lookup for delete failed")
+        await status.edit_text(f"❌ Lookup failed: {type(e).__name__}: {e}")
+        return
+
+    if not doc:
+        await status.edit_text(
+            f"No published title matching `{title}` found. Try `/find <title>` "
+            "if you're not sure of the exact title."
+        )
+        return
+
+    links_count = len(doc.get("directLinks") or [])
+    PENDING_CATALOG_DELETE[message.chat.id] = {
+        "doc_id": doc["id"], "title": doc.get("title"), "title_query": title,
+    }
+    await status.edit_text(
+        f"⚠️ **Confirm delete**\n\n"
+        f"`{doc.get('title', 'Untitled')}` — {doc.get('category', '?')}, "
+        f"{links_count} link(s), year {doc.get('year') or '?'}\n\n"
+        "This permanently deletes the entire entry (all episodes/links included) "
+        "from the site. This can't be undone.\n\n"
+        f"Reply `/deletetitle {title}` again to confirm."
+    )
+
+
+# ── Announcements ─────────────────────────────────────────────────────────
+# Mirrors admin.html's Announcement tab -- a single site-wide dismissible
+# banner (see js/admin.js: executeAdminAnnouncementUpload). Unlike catalog
+# entries there's only ever one of these, so no title/lookup step is
+# needed -- just set it, or flip it on/off.
+
+ANNOUNCEMENT_USAGE = (
+    "Usage:\n"
+    "`/announce <message>` — set the message (keeps current on/off state)\n"
+    "`/announce <message> | <title> | <tone> | <linkUrl> | <linkLabel>` — full form\n\n"
+    "tone must be one of: info, success, warning, alert (default: info)\n"
+    "title, linkUrl, linkLabel are all optional. Examples:\n"
+    "`/announce Servers under maintenance tonight`\n"
+    "`/announce New feature is live! | Heads up: | success | https://example.com | Learn more`"
+)
+
+
+@app.on_message(filters.private & filters.command("announce"))
+async def handle_announce(client: Client, message: Message):
+    raw = message.text.split(None, 1)
+    args = raw[1].strip() if len(raw) > 1 else ""
+    if not args:
+        await message.reply_text(ANNOUNCEMENT_USAGE)
+        return
+
+    parts = [p.strip() for p in args.split("|")]
+    msg_text = parts[0]
+    title = parts[1] if len(parts) > 1 else ""
+    tone = parts[2] if len(parts) > 2 and parts[2] else "info"
+    link_url = parts[3] if len(parts) > 3 else ""
+    link_label = parts[4] if len(parts) > 4 else ""
+
+    if not msg_text:
+        await message.reply_text("Message can't be empty.\n\n" + ANNOUNCEMENT_USAGE)
+        return
+
+    status = await message.reply_text("📡 Updating announcement...")
+    try:
+        result = await asyncio.to_thread(
+            firestore_publish.set_announcement,
+            msg_text, title, tone, link_url, link_label, None,
+        )
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}\n\n{ANNOUNCEMENT_USAGE}")
+        return
+    except Exception as e:
+        logger.exception("Announcement update failed")
+        await status.edit_text(f"❌ Update failed: {type(e).__name__}: {e}")
+        return
+
+    state_word = "LIVE for all visitors" if result["isActive"] else "saved but hidden (use `/announceon` to show it)"
+    await status.edit_text(f"✅ Announcement updated — {state_word}.")
+
+
+@app.on_message(filters.private & filters.command("announceon"))
+async def handle_announce_on(client: Client, message: Message):
+    status = await message.reply_text("📡 Turning announcement on...")
+    try:
+        await asyncio.to_thread(firestore_publish.set_announcement_active, True)
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("Announcement toggle failed")
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {e}")
+        return
+    await status.edit_text("✅ Announcement is now **LIVE** for all visitors.")
+
+
+@app.on_message(filters.private & filters.command("announceoff"))
+async def handle_announce_off(client: Client, message: Message):
+    status = await message.reply_text("📡 Turning announcement off...")
+    try:
+        await asyncio.to_thread(firestore_publish.set_announcement_active, False)
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("Announcement toggle failed")
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {e}")
+        return
+    await status.edit_text("✅ Announcement is now **hidden** from visitors.")
+
+
+@app.on_message(filters.private & filters.command(["announcestatus", "announcement"]))
+async def handle_announce_status(client: Client, message: Message):
+    status = await message.reply_text("🔎 Checking current announcement...")
+    try:
+        current = await asyncio.to_thread(firestore_publish.get_announcement)
+    except Exception as e:
+        logger.exception("Announcement status check failed")
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {e}")
+        return
+
+    if not current["message"]:
+        await status.edit_text(
+            "No announcement has been set yet.\n\n" + ANNOUNCEMENT_USAGE
+        )
+        return
+
+    state_word = "🟢 LIVE" if current["isActive"] else "⚪ Hidden"
+    lines = [
+        f"📢 **Current announcement** — {state_word}",
+        "",
+        f"• Title: `{current['title'] or '(none)'}`",
+        f"• Message: {current['message']}",
+        f"• Tone: `{current['tone']}`",
+    ]
+    if current["linkUrl"]:
+        lines.append(f"• Link: {current['linkUrl']} (\"{current['linkLabel'] or 'no label'}\")")
+    lines.append("")
+    lines.append("`/announce <message>` to change it, `/announceon`/`/announceoff` to toggle visibility.")
+    await status.edit_text("\n".join(lines))
+
+
 POLL_INTERVAL_SECONDS = int(os.getenv("TORRENT_POLL_INTERVAL_SECONDS", "30"))
 
 
@@ -1592,7 +1926,7 @@ async def _handle_polled_torrent_upload(client: Client, item: dict):
         "episode": guess_episode,
         "url": dood_url,
         "year": None,
-        "category": "series" if guess_episode else "movie",
+        "category": "series" if guess_episode else "movies",
         "quality": guess_quality,
         "episode_was_inferred": episode_was_inferred,
         "tmdb_candidates": None,
