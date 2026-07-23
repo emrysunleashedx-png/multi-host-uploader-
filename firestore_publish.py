@@ -921,7 +921,212 @@ def migrate_movie_category_typos(dry_run: bool = True) -> dict:
     return {"matched": matched, "updated": not dry_run}
 
 
-# ── Announcements ─────────────────────────────────────────────────────────
+# ── Sitemap generation ────────────────────────────────────────────────────
+# Generates sitemap.xml from the live Firestore catalog, matching the URL
+# shape js/slug.js's buildMovieUrl() produces client-side. robots.txt
+# already points at /sitemap.xml (see repo root), but the file itself has
+# always been empty -- there's no build step that populates it, since the
+# catalog only exists in Firestore, not as static files. This is that
+# missing generation step, triggered manually from the bot rather than
+# baked into a Cloud Function (see /sitemap in main.py).
+#
+# SITE_ORIGIN is the one thing that can't be derived from Firestore or
+# ported from the client-side code -- js/slug.js builds absolute URLs from
+# `location.origin` at runtime in the browser, which has no equivalent on
+# a server. Hardcoded here; update it if the production domain ever changes.
+SITE_ORIGIN = "https://novaflix.com.ng"
+
+# Static, non-catalog pages worth listing explicitly -- mirrors the site's
+# own top-level nav (index.html links to these; see js/router.js's cases).
+# Priority/changefreq follow standard sitemap.org conventions: the
+# homepage and catalog listing pages change often and matter most; detail
+# pages change less often per-page (mainly when a new episode/link is
+# added) and site/legal pages barely change at all.
+_STATIC_PAGES = [
+    {"path": "/", "changefreq": "daily", "priority": "1.0"},
+    {"path": "/movies.html", "changefreq": "daily", "priority": "0.9"},
+    {"path": "/series.html", "changefreq": "daily", "priority": "0.9"},
+    {"path": "/category.html", "changefreq": "weekly", "priority": "0.6"},
+    {"path": "/about.html", "changefreq": "monthly", "priority": "0.3"},
+    {"path": "/contact.html", "changefreq": "monthly", "priority": "0.3"},
+]
+
+
+def _xml_escape(text: str) -> str:
+    """Minimal XML entity escaping for text going into sitemap.xml. Only
+    the five characters XML actually requires escaping for -- no need for
+    a full XML library just for this.
+    """
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _build_movie_url_path(item: dict, slug_counts: dict) -> str:
+    """Python port of buildMovieUrl() in js/slug.js, computing just the
+    path (SITE_ORIGIN is prepended by the caller). slug_counts must be a
+    dict of {slug: count_of_titles_producing_that_slug} across the WHOLE
+    catalog -- see generate_sitemap_xml for why this can't be computed
+    per-item in isolation. Falls back to "title" for a blank/unslugg-able
+    title, matching the JS's `slugify(item.title) || "title"`.
+    """
+    slug = slugify(item.get("title", "")) or "title"
+    collides = slug_counts.get(slug, 0) > 1
+    if collides:
+        return f"/movie/{slug}-{item['id']}"
+    return f"/movie/{slug}"
+
+
+def generate_sitemap_xml() -> str:
+    """Build a complete sitemap.xml string from the current Firestore
+    catalog plus the static top-level pages. Returns the raw XML text --
+    callers decide what to do with it (main.py sends it to the admin as
+    a file, since the bot has no direct way to push files into Firebase
+    Hosting's static file tree -- see /sitemap's docstring in main.py).
+
+    Collision detection (whether a title needs the "-<id>" suffix)
+    mirrors buildMovieUrl() exactly: it's a catalog-wide comparison ("does
+    ANY other title produce the same slug"), not a per-item check, so this
+    fetches every doc's title once up front to compute slug counts before
+    building any individual URL -- getting this wrong would silently
+    produce a sitemap with duplicate/colliding URLs for any two titles
+    that happen to slugify the same way (e.g. "Alice (2019)" and
+    "Alice: 2019" both -> "alice-2019").
+    """
+    db = _db or init_firebase()
+
+    docs = list(db.collection(ROOT_COLLECTION).select(
+        ["title", "category", "timestamp"]
+    ).stream())
+
+    items = []
+    slug_counts = {}
+    for doc in docs:
+        data = doc.to_dict() or {}
+        title = data.get("title", "")
+        slug = slugify(title) or "title"
+        slug_counts[slug] = slug_counts.get(slug, 0) + 1
+        items.append({
+            "id": doc.id,
+            "title": title,
+            "category": data.get("category", ""),
+            "timestamp": data.get("timestamp"),
+        })
+
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>']
+    lines.append('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
+
+    for page in _STATIC_PAGES:
+        lines.append("  <url>")
+        lines.append(f"    <loc>{_xml_escape(SITE_ORIGIN + page['path'])}</loc>")
+        lines.append(f"    <changefreq>{page['changefreq']}</changefreq>")
+        lines.append(f"    <priority>{page['priority']}</priority>")
+        lines.append("  </url>")
+
+    for item in items:
+        path = _build_movie_url_path(item, slug_counts)
+        lines.append("  <url>")
+        lines.append(f"    <loc>{_xml_escape(SITE_ORIGIN + path)}</loc>")
+        # lastmod, if the doc has a timestamp -- Firestore SERVER_TIMESTAMP
+        # values come back as a datetime-like object with isoformat().
+        ts = item.get("timestamp")
+        if ts is not None and hasattr(ts, "isoformat"):
+            lines.append(f"    <lastmod>{ts.isoformat()}</lastmod>")
+        lines.append("    <changefreq>weekly</changefreq>")
+        lines.append("    <priority>0.7</priority>")
+        lines.append("  </url>")
+
+    lines.append("</urlset>")
+    return "\n".join(lines) + "\n"
+
+
+# ── Promos ────────────────────────────────────────────────────────────────
+# Mirrors admin.html's Promo tab (see js/admin.js:
+# executeAdminPromoUpload) -- a single site-wide banner image doc at
+# banners/activePromo, shown globally when isActive is true. Simpler than
+# announcements: just an image URL + destination link, both required by
+# the web form, no title/tone/timestamp.
+
+_PROMO_DOC = ("banners", "activePromo")
+
+
+def get_promo() -> dict:
+    """Fetch the current promo banner doc, or a dict of defaults (empty
+    URLs, isActive False) if none has ever been set -- mirrors
+    admin.html's load path (see the getDoc call around line 525).
+    """
+    db = _db or init_firebase()
+    snap = db.collection(_PROMO_DOC[0]).document(_PROMO_DOC[1]).get()
+    if not snap.exists:
+        return {"imageUrl": "", "targetUrl": "", "isActive": False}
+    data = snap.to_dict() or {}
+    return {
+        "imageUrl": data.get("imageUrl", ""),
+        "targetUrl": data.get("targetUrl", ""),
+        "isActive": bool(data.get("isActive", False)),
+    }
+
+
+def set_promo(image_url: str, target_url: str, is_active: bool = None) -> dict:
+    """Write the promo banner doc. Full overwrite (setDoc, matching
+    admin.html) -- both imageUrl and targetUrl are required, same as the
+    web form's `required` attributes on both inputs.
+
+    is_active, if None, PRESERVES the current doc's isActive value, same
+    reasoning as set_announcement: a chat command has no checkbox to
+    carry along, so re-running `/promo <img> <link>` to fix a typo
+    shouldn't silently take a live banner down or bring a hidden one up.
+
+    Returns {"ok": True, "isActive": bool}.
+    """
+    db = _db or init_firebase()
+
+    image_url = (image_url or "").strip()
+    target_url = (target_url or "").strip()
+    if not image_url:
+        raise ValueError("imageUrl can't be empty")
+    if not target_url:
+        raise ValueError("targetUrl can't be empty")
+
+    if is_active is None:
+        current = get_promo()
+        is_active = current["isActive"]
+
+    payload = {
+        "imageUrl": image_url,
+        "targetUrl": target_url,
+        "isActive": bool(is_active),
+    }
+    db.collection(_PROMO_DOC[0]).document(_PROMO_DOC[1]).set(payload)
+    logger.info("Promo banner updated (isActive=%s)", payload["isActive"])
+    return {"ok": True, "isActive": payload["isActive"]}
+
+
+def set_promo_active(is_active: bool) -> dict:
+    """Flip just the isActive flag on the existing promo doc, without
+    touching imageUrl/targetUrl -- for /promoon and /promooff.
+
+    Raises ValueError if no promo has ever been created (nothing to
+    toggle) -- same reasoning as set_announcement_active: turning on an
+    empty banner with no image/link would be visibly broken to visitors.
+    """
+    db = _db or init_firebase()
+    doc_ref = db.collection(_PROMO_DOC[0]).document(_PROMO_DOC[1])
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise ValueError("No promo banner has been set yet. Use `/promo <imageUrl> <targetUrl>` first.")
+
+    doc_ref.update({"isActive": bool(is_active)})
+    logger.info("Promo banner isActive set to %s", is_active)
+    return {"ok": True, "isActive": bool(is_active)}
+
+
+
 # Mirrors admin.html's Announcement tab (see js/admin.js:
 # executeAdminAnnouncementUpload) -- a single site-wide banner doc at
 # announcements/siteAnnouncement, shown in a dismissible bar at the top
