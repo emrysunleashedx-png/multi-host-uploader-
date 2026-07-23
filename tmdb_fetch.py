@@ -236,4 +236,3 @@ async def fetch_tmdb_details(tmdb_id: int, tmdb_type: str) -> dict:
         "voteAverage": vote_average,
         "cast": cast,
     }
-
