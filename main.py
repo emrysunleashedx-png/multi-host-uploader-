@@ -1081,6 +1081,9 @@ async def handle_help(client: Client, message: Message):
         "• `/edittitle <title> | field=value | field=value | ...` — update specific fields "
         "on an existing title (e.g. `/edittitle The Scarecrow | year=2024 | genre=Drama`)\n"
         "• `/deletetitle <title>` — permanently delete a title (asks for confirmation first)\n\n"
+        "**SEO**:\n"
+        "• `/sitemap` — generate sitemap.xml from the current catalog and send it to you "
+        "(you still need to redeploy it — see the caption when it's sent)\n\n"
         "**Discover** (read-only Trakt trending lists):\n"
         "• `/discover [movies|series] [trending|popular|anticipated]` — see what's hot on Trakt "
         "right now (defaults to `movies trending`)\n\n"
@@ -1739,7 +1742,56 @@ async def handle_delete_title(client: Client, message: Message):
     )
 
 
-# ── Trending (Trakt) ─────────────────────────────────────────────────────
+# ── Sitemap ──────────────────────────────────────────────────────────────
+# Fills the gap left by robots.txt pointing at an always-empty
+# sitemap.xml (see firestore_publish.py's generate_sitemap_xml for why
+# this can't just be a static file -- the catalog only exists in
+# Firestore). Sends the generated file to the admin as a document rather
+# than writing it anywhere the site would serve it from directly: the
+# bot's Firebase credentials (service-account, via firestore_publish.py)
+# only grant Firestore access, not Firebase Hosting deploy access, so
+# there's no path from "the bot has a file" to "the site serves that
+# file" without a human in the loop running `firebase deploy` (or
+# committing it and letting existing CI do so) anyway.
+SITEMAP_LOCAL_PATH = "/tmp/novaflix_sitemap.xml"
+
+
+@app.on_message(filters.private & filters.command("sitemap"))
+async def handle_sitemap(client: Client, message: Message):
+    status = await message.reply_text("🗺️ Generating sitemap from the current catalog...")
+    try:
+        xml_text = await asyncio.to_thread(firestore_publish.generate_sitemap_xml)
+    except Exception as e:
+        logger.exception("Sitemap generation failed")
+        await status.edit_text(f"❌ Generation failed: {type(e).__name__}: {e}")
+        return
+
+    try:
+        with open(SITEMAP_LOCAL_PATH, "w", encoding="utf-8") as f:
+            f.write(xml_text)
+    except OSError as e:
+        logger.exception("Failed to write sitemap to disk")
+        await status.edit_text(f"❌ Couldn't write the file: {type(e).__name__}: {e}")
+        return
+
+    url_count = xml_text.count("<url>")
+    await status.edit_text(f"✅ Generated — {url_count} URL(s). Sending the file now...")
+    await message.reply_document(
+        SITEMAP_LOCAL_PATH,
+        file_name="sitemap.xml",
+        caption=(
+            f"📄 **sitemap.xml** — {url_count} URL(s)\n\n"
+            "To publish this:\n"
+            "1. Replace `sitemap.xml` in the site's repo root with this file\n"
+            "2. Redeploy hosting (`firebase deploy --only hosting`, or however your "
+            "CI does it)\n\n"
+            "Nothing on the live site changes until you do that — this file isn't "
+            "auto-deployed."
+        ),
+    )
+
+
+
 # Mirrors the read-only discovery half of admin.html's Trending tab (see
 # js/admin.js: fetchAndRenderTrendingList / fetchTraktList) -- browse
 # what's currently trending/popular/anticipated on Trakt. Read-only and
