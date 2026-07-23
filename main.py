@@ -8,6 +8,7 @@ from pyrogram.types import Message
 
 import firestore_publish
 import tmdb_fetch
+import trakt_fetch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1080,6 +1081,14 @@ async def handle_help(client: Client, message: Message):
         "• `/edittitle <title> | field=value | field=value | ...` — update specific fields "
         "on an existing title (e.g. `/edittitle The Scarecrow | year=2024 | genre=Drama`)\n"
         "• `/deletetitle <title>` — permanently delete a title (asks for confirmation first)\n\n"
+        "**Discover** (read-only Trakt trending lists):\n"
+        "• `/discover [movies|series] [trending|popular|anticipated]` — see what's hot on Trakt "
+        "right now (defaults to `movies trending`)\n\n"
+        "**Promo banner** (site-wide image banner):\n"
+        "• `/promo <imageUrl> <targetUrl>` — set the banner image + destination link "
+        "(keeps current on/off state)\n"
+        "• `/promoon`, `/promooff` — show/hide the banner without retyping it\n"
+        "• `/promostatus` — see the current banner URLs and on/off state\n\n"
         "**Announcements** (site-wide dismissible banner):\n"
         "• `/announce <message>` — set the banner message (keeps current on/off state)\n"
         "• `/announce <message> | <title> | <tone> | <linkUrl> | <linkLabel>` — full form "
@@ -1728,6 +1737,184 @@ async def handle_delete_title(client: Client, message: Message):
         "from the site. This can't be undone.\n\n"
         f"Reply `/deletetitle {title}` again to confirm."
     )
+
+
+# ── Trending (Trakt) ─────────────────────────────────────────────────────
+# Mirrors the read-only discovery half of admin.html's Trending tab (see
+# js/admin.js: fetchAndRenderTrendingList / fetchTraktList) -- browse
+# what's currently trending/popular/anticipated on Trakt. Read-only and
+# self-contained: no publish pipeline involvement, no pending state. See
+# trakt_fetch.py's module docstring for why the title-search-and-autofill
+# half of that admin tab (admTraktFetchBtn) is intentionally NOT ported --
+# that's a distinct feature from "show me what's trending".
+
+DISCOVER_USAGE = (
+    "Usage: `/discover [movies|series] [trending|popular|anticipated]`\n\n"
+    "Both parts are optional and default to `movies trending`. Examples:\n"
+    "`/discover` — trending movies\n"
+    "`/discover series` — trending series\n"
+    "`/discover movies popular`\n"
+    "`/discover series anticipated`"
+)
+
+_TRENDING_KIND_ALIASES = {
+    "trending": "trending", "popular": "popular", "anticipated": "anticipated",
+}
+_TRENDING_TYPE_ALIASES = {
+    "movie": "movie", "movies": "movie", "film": "movie", "films": "movie",
+    "show": "show", "shows": "show", "series": "show", "tv": "show",
+}
+
+
+@app.on_message(filters.private & filters.command("discover"))
+async def handle_discover(client: Client, message: Message):
+    raw = message.text.split(None, 1)
+    args = raw[1].strip().lower().split() if len(raw) > 1 else []
+
+    trakt_type = "movie"
+    kind = "trending"
+    unrecognized = []
+    for arg in args:
+        if arg in _TRENDING_TYPE_ALIASES:
+            trakt_type = _TRENDING_TYPE_ALIASES[arg]
+        elif arg in _TRENDING_KIND_ALIASES:
+            kind = _TRENDING_KIND_ALIASES[arg]
+        else:
+            unrecognized.append(arg)
+
+    if unrecognized:
+        await message.reply_text(
+            f"Didn't recognize: {', '.join(unrecognized)}\n\n{DISCOVER_USAGE}"
+        )
+        return
+
+    type_label = "series" if trakt_type == "show" else "movies"
+    status = await message.reply_text(f"🔎 Loading {kind} {type_label} from Trakt...")
+    try:
+        items = await trakt_fetch.fetch_trending_with_posters(trakt_type, kind, limit=10)
+    except Exception as e:
+        logger.exception("Trakt trending fetch failed")
+        await status.edit_text(
+            f"❌ Fetch failed: {type(e).__name__}: {e}\n\n"
+            "Check your network/Trakt status and try again."
+        )
+        return
+
+    if not items:
+        await status.edit_text(f"No results for {kind} {type_label}. Try a different list.")
+        return
+
+    lines = [f"🔥 **{kind.capitalize()} {type_label}** (Trakt):", ""]
+    for i, item in enumerate(items, start=1):
+        lines.append(trakt_fetch.format_trending_line(item, i))
+    await status.edit_text("\n".join(lines))
+
+
+
+# Mirrors admin.html's Promo tab -- a single site-wide banner image (see
+# js/admin.js: executeAdminPromoUpload). Just two required URLs, so plain
+# space-separated args read cleaner here than the `|`-delimited style
+# /edit and /announce use for their longer, mostly-optional field lists.
+
+PROMO_USAGE = (
+    "Usage: `/promo <imageUrl> <targetUrl>`\n\n"
+    "Both are required. Keeps the current on/off state -- use `/promoon`/"
+    "`/promooff` to change visibility. Example:\n"
+    "`/promo https://cdn.example.com/banner.jpg https://example.com/sale`"
+)
+
+
+@app.on_message(filters.private & filters.command("promo"))
+async def handle_promo(client: Client, message: Message):
+    raw = message.text.split(None, 1)
+    args = raw[1].strip() if len(raw) > 1 else ""
+    if not args:
+        await message.reply_text(PROMO_USAGE)
+        return
+
+    parts = args.split()
+    if len(parts) != 2:
+        await message.reply_text(
+            "Need exactly two URLs (image, then destination link) — "
+            "if either URL itself contains a space, that shouldn't happen for "
+            "a valid URL.\n\n" + PROMO_USAGE
+        )
+        return
+    image_url, target_url = parts
+
+    status = await message.reply_text("📡 Updating promo banner...")
+    try:
+        result = await asyncio.to_thread(
+            firestore_publish.set_promo, image_url, target_url, None,
+        )
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}\n\n{PROMO_USAGE}")
+        return
+    except Exception as e:
+        logger.exception("Promo update failed")
+        await status.edit_text(f"❌ Update failed: {type(e).__name__}: {e}")
+        return
+
+    state_word = "LIVE for all visitors" if result["isActive"] else "saved but hidden (use `/promoon` to show it)"
+    await status.edit_text(f"✅ Promo banner updated — {state_word}.")
+
+
+@app.on_message(filters.private & filters.command("promoon"))
+async def handle_promo_on(client: Client, message: Message):
+    status = await message.reply_text("📡 Turning promo banner on...")
+    try:
+        await asyncio.to_thread(firestore_publish.set_promo_active, True)
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("Promo toggle failed")
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {e}")
+        return
+    await status.edit_text("✅ Promo banner is now **LIVE** for all visitors.")
+
+
+@app.on_message(filters.private & filters.command("promooff"))
+async def handle_promo_off(client: Client, message: Message):
+    status = await message.reply_text("📡 Turning promo banner off...")
+    try:
+        await asyncio.to_thread(firestore_publish.set_promo_active, False)
+    except ValueError as e:
+        await status.edit_text(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("Promo toggle failed")
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {e}")
+        return
+    await status.edit_text("✅ Promo banner is now **hidden** from visitors.")
+
+
+@app.on_message(filters.private & filters.command(["promostatus", "promotion"]))
+async def handle_promo_status(client: Client, message: Message):
+    status = await message.reply_text("🔎 Checking current promo banner...")
+    try:
+        current = await asyncio.to_thread(firestore_publish.get_promo)
+    except Exception as e:
+        logger.exception("Promo status check failed")
+        await status.edit_text(f"❌ Failed: {type(e).__name__}: {e}")
+        return
+
+    if not current["imageUrl"]:
+        await status.edit_text(
+            "No promo banner has been set yet.\n\n" + PROMO_USAGE
+        )
+        return
+
+    state_word = "🟢 LIVE" if current["isActive"] else "⚪ Hidden"
+    lines = [
+        f"🖼️ **Current promo banner** — {state_word}",
+        "",
+        f"• Image: {current['imageUrl']}",
+        f"• Links to: {current['targetUrl']}",
+        "",
+        "`/promo <imageUrl> <targetUrl>` to change it, `/promoon`/`/promooff` to toggle visibility.",
+    ]
+    await status.edit_text("\n".join(lines))
 
 
 # ── Announcements ─────────────────────────────────────────────────────────
